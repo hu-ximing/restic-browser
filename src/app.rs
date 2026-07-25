@@ -18,7 +18,7 @@ use crate::{
     jobs::JobHandle,
     model::{FileEntry, PreviewArtifact, SearchResult, Snapshot},
     preview::PreviewService,
-    restic::ResticClient,
+    repository::RepositoryHandle,
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -61,7 +61,7 @@ impl ActiveJob {
 }
 
 pub struct App {
-    restic: Arc<ResticClient>,
+    repository: RepositoryHandle,
     preview_service: Arc<PreviewService>,
     export_service: ExportService,
     snapshots: Vec<Snapshot>,
@@ -82,7 +82,7 @@ pub struct App {
 
 impl App {
     pub fn new(
-        restic: Arc<ResticClient>,
+        repository: RepositoryHandle,
         preview_service: Arc<PreviewService>,
         snapshots: Vec<Snapshot>,
     ) -> Self {
@@ -92,7 +92,7 @@ impl App {
             Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
         };
         let mut app = Self {
-            restic,
+            repository,
             preview_service,
             export_service: ExportService,
             snapshots,
@@ -287,7 +287,7 @@ impl App {
         };
         self.replace_job();
         self.status = format!("正在加载 {path}…");
-        let client = Arc::clone(&self.restic);
+        let client = Arc::clone(&self.repository);
         self.active_job = Some(ActiveJob::Directory(JobHandle::spawn_cancellable(
             move |token| async move { client.list_directory(&snapshot.id, &path, token).await },
         )));
@@ -304,7 +304,7 @@ impl App {
         self.replace_job();
         self.clear_preview();
         self.status = format!("正在搜索 {pattern}…");
-        let client = Arc::clone(&self.restic);
+        let client = Arc::clone(&self.repository);
         self.active_job = Some(ActiveJob::Search(JobHandle::spawn_cancellable(
             move |token| async move { client.find(&snapshot.id, &pattern, token).await },
         )));
@@ -322,9 +322,13 @@ impl App {
             return;
         }
         self.replace_job();
-        self.status = format!("正在预览 {}…", entry.name);
+        self.status = if self.repository.content_index_ready() {
+            format!("正在预览 {}…", entry.name)
+        } else {
+            format!("首次读取：正在建立文件索引并预览 {}…", entry.name)
+        };
         let service = Arc::clone(&self.preview_service);
-        let client = Arc::clone(&self.restic);
+        let client = Arc::clone(&self.repository);
         let position = self.video_position;
         self.active_job = Some(ActiveJob::Preview(JobHandle::spawn_cancellable(
             move |token| async move {
@@ -347,8 +351,12 @@ impl App {
             return;
         }
         self.replace_job();
-        self.status = format!("正在导出 {}…", entry.name);
-        let client = Arc::clone(&self.restic);
+        self.status = if self.repository.content_index_ready() {
+            format!("正在导出 {}…", entry.name)
+        } else {
+            format!("首次读取：正在建立文件索引并导出 {}…", entry.name)
+        };
+        let client = Arc::clone(&self.repository);
         let service = self.export_service.clone();
         self.active_job = Some(ActiveJob::Export(JobHandle::spawn_cancellable(
             move |token| async move {
@@ -621,7 +629,7 @@ mod tests {
 
     use super::{App, centered_rect, format_size};
     use crate::{
-        cache::SessionCache, model::Snapshot, preview::PreviewService, restic::ResticClient,
+        cache::SessionCache, model::Snapshot, preview::PreviewService, restic::ResticCliClient,
     };
     use ratatui::{
         Terminal,
@@ -648,7 +656,7 @@ mod tests {
     async fn renders_supported_terminal_sizes_and_resize() {
         let repository = tempfile::tempdir().unwrap();
         let client = Arc::new(
-            ResticClient::new(
+            ResticCliClient::new(
                 "restic",
                 repository.path(),
                 SecretString::from("test".to_owned()),

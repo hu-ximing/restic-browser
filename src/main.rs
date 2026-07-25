@@ -1,14 +1,21 @@
 use std::{fs::OpenOptions, path::PathBuf, sync::Arc};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use secrecy::SecretString;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use restic_browser::{
     AppError, Result, app::App, cache::SessionCache, error::redact, preview::PreviewService,
-    restic::ResticClient, terminal,
+    repository::RepositoryHandle, restic::ResticCliClient, rustic::RusticClient, terminal,
 };
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum Backend {
+    #[default]
+    Rustic,
+    ResticCli,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -19,6 +26,8 @@ use restic_browser::{
 struct Cli {
     #[arg(short = 'r', long, env = "RESTIC_REPOSITORY")]
     repository: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t)]
+    backend: Backend,
     #[arg(long, default_value = "restic")]
     restic: PathBuf,
     #[arg(long, default_value = "ffmpeg")]
@@ -44,18 +53,23 @@ async fn run() -> Result<()> {
         .repository
         .ok_or_else(|| AppError::Other("请使用 --repository 指定本地仓库".to_owned()))?;
 
-    ResticClient::check_version(&cli.restic).await?;
+    if matches!(cli.backend, Backend::ResticCli) {
+        ResticCliClient::check_version(&cli.restic).await?;
+    }
     let cache = SessionCache::new()?;
     let preview_service = PreviewService::new(cli.ffmpeg, cli.ffprobe, cache);
     preview_service.check_dependencies().await?;
 
     rtoolbox::print_tty::print_tty("仓库密码: ").map_err(AppError::Io)?;
     let password = rpassword::read_password().map_err(AppError::Io)?;
-    let client = Arc::new(ResticClient::new(
-        cli.restic,
-        repository,
-        SecretString::from(password),
-    )?);
+    let client: RepositoryHandle = match cli.backend {
+        Backend::Rustic => Arc::new(RusticClient::open(repository, password)?),
+        Backend::ResticCli => Arc::new(ResticCliClient::new(
+            cli.restic,
+            repository,
+            SecretString::from(password),
+        )?),
+    };
     let snapshots = client
         .list_snapshots(CancellationToken::new())
         .await

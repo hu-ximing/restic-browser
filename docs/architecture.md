@@ -2,189 +2,152 @@
 
 ## 文档状态
 
-本文以当前代码为准。`rustic_core` 迁移、目录预取和目录结果缓存均尚未实现；相关方案单独
-记录在 [rustic-core-migration.md](rustic-core-migration.md)。
+本文描述当前代码。默认 `rustic_core` 后端、CLI 回退和懒索引已经实现；目录预取、目录结果
+缓存、远程后端和完整 `JobManager` 服务仍是未来设想。
 
-## 当前系统概览
+## 系统概览
 
 ```mermaid
 flowchart LR
-    Main["main<br/>参数、依赖检查、密码、初始快照"] --> App["App<br/>TUI 状态与交互"]
-    Terminal["terminal<br/>事件循环与终端恢复"] <--> App
-    App --> Jobs["JobHandle + ActiveJob<br/>单个活动任务与取消"]
-    Jobs --> Restic["ResticClient<br/>只读仓库操作"]
+    Main["main<br/>参数、密码、后端选择"] --> Repo["RepositoryReader<br/>只读领域接口"]
+    Repo --> Rustic["RusticClient<br/>默认、进程内会话"]
+    Repo --> CLI["ResticCliClient<br/>显式回退"]
+    Main --> App["App<br/>TUI 状态与交互"]
+    Terminal["terminal<br/>事件与终端恢复"] <--> App
+    App --> Jobs["JobHandle / ActiveJob<br/>一个活动任务"]
+    Jobs --> Repo
     Jobs --> Preview["PreviewService"]
     Jobs --> Export["ExportService"]
-    Preview --> Restic
-    Export --> Restic
-    Preview --> Cache["SessionCache<br/>预览临时文件，512 MiB"]
-    Restic --> ResticExe["restic 子进程"]
-    Preview --> Probe["ffprobe 子进程"]
-    Preview --> Ffmpeg["ffmpeg 子进程"]
+    Preview --> Repo
+    Export --> Repo
+    Preview --> Cache["SessionCache<br/>512 MiB"]
+    CLI --> ResticExe["restic 子进程"]
+    Preview --> Media["ffprobe / ffmpeg 子进程"]
 ```
 
-### 启动入口
+## 模块职责
 
-`main.rs` 负责解析 CLI、启用可选日志、检查依赖、隐藏输入密码、构造服务和读取初始快照。
-当前启动顺序要求 restic、ffmpeg 和 ffprobe 都可用，即使本次会话不打开媒体预览。
-仓库或认证验证失败时程序直接退出，不进入 TUI。
+### 入口和后端选择
 
-### TUI 与应用状态
+`main.rs` 解析参数、启用可选日志、检查依赖、隐藏输入密码并构造后端。默认
+`--backend rustic` 使用 `RusticClient`；只有显式 `--backend restic-cli` 才检查并启动
+restic 0.19.x。两条路径都先列快照验证仓库，再进入 TUI，不做静默回退。
 
-`terminal.rs` 使用 Crossterm 和 Ratatui：
+ffmpeg 和 ffprobe 当前在启动时检查，即使本次会话最终没有打开媒体预览。
 
-- 进入 raw mode 和备用屏幕，循环绘制并轮询事件。
-- 忽略 `KeyEventKind::Release`，避免一次按键在某些终端被处理两次；保留正常的按键重复。
-- `TerminalGuard` 在正常返回和 Rust 栈展开时恢复终端状态。
+### 只读仓库接口
 
-`app.rs` 的 `App` 保存快照、当前目录条目、焦点、输入模式、预览、状态文本和一个活动任务。
-它处理键盘命令并把耗时操作交给后台任务。界面分为快照列表、文件列表、预览/元数据区和
-状态/快捷键区。
+`repository.rs` 的 `RepositoryReader` 是 TUI 和仓库实现之间的最小对象安全接口：
 
-`model.rs` 定义了领域对象，包括 `Snapshot`、`FileEntry`、`SearchResult`、
-`MediaMetadata` 和 `PreviewArtifact`。其中也有 `SessionStateMachine` 和
-`JobStatus` 类型，但当前运行时尚未接入完整的 `Locked → Opening → Ready` 状态机，
-也没有手动锁定功能。
+- 列快照；
+- 列指定快照的一个目录层级；
+- 在指定快照搜索；
+- 将一个文件读取到指定本地路径；
+- 报告内容完整索引是否已经就绪。
 
-### ResticClient
+接口只使用 `Snapshot`、`FileEntry`、`SearchResult` 等应用领域类型，不向上层暴露
+`rustic_core` 类型或 CLI JSON。`PreviewService`、`ExportService` 和 `App` 都依赖同一个
+`Arc<dyn RepositoryReader>`，所以切换后端不改变 TUI 行为。
 
-`restic.rs` 是当前仓库读取边界。它持有 restic 可执行文件、本地仓库路径和会话密码，
-提供以下实际接口语义：
+### 默认 RusticClient
 
-- 读取并按时间倒序排列所有快照。
-- 列出选定快照和路径的直接子项，目录优先排序。
-- 用 restic pattern 搜索指定快照。
-- 将指定文件内容 dump 到本地路径。
+`rustic.rs` 使用固定版本的第三方 `rustic_core`/`rustic_backend`：
 
-返回值目前是完整的 `Vec` 或已写完的文件，不是流。JSON 输出先完整读入内存再解析。
-路径在仓库内部统一规范化为 `/` 分隔；本地可执行文件和导出路径使用 `PathBuf`/
-`OsString`。
+1. 本地 backend 打开并解锁仓库。
+2. 启动时建立仅含 blob ID 的索引 `to_indexed_ids()`，用于快照和目录树读取。
+3. 列目录时从快照树只迭代当前层；搜索时递归迭代所选快照。
+4. 首次读取文件内容时把仓库状态升级为 `to_indexed()` 完整索引，之后复用。
 
-### 预览
+`rustic_core` API 是同步的。`BlockingExecutor` 使用一个专用工作线程串行执行仓库操作，
+通过 oneshot 把结果交回 Tokio，避免阻塞 TUI 事件循环。迭代目录、搜索和写文件时检查
+取消令牌；正在执行的索引升级本身无法中断。
 
-`PreviewService` 先通过 `ResticClient::dump_to_path` 把文件放入会话临时目录，再按类型
-处理：
+### CLI 回退
 
-- 文本读取最多 2 MiB，超出部分标记为截断。
-- 图片由 `image` crate 解码，再交给 `ratatui-image`。
-- 视频由 ffprobe 读取 JSON 元数据，由 ffmpeg 生成最大 1280 像素宽的 PNG 单帧。
-- 音频和未知类型不播放；尝试通过 ffprobe 提供元数据。
-- 文件大于 512 MiB 时不 dump，也不生成媒体预览。
+`restic.rs` 的 `ResticCliClient` 实现相同接口。生产命令白名单只有 `snapshots`、`ls`、
+`find` 和 `dump`，另有启动前的 `version` 检查。每个操作启动独立 restic 子进程并完整
+收集 JSON/输出；取消会 kill 并 wait 子进程。
 
-图像协议通过终端查询自动选择；查询失败时使用 Unicode half-block。当前没有文本滚动、
-PDF、音频或连续视频播放。
+### TUI、应用状态和任务
 
-### 导出
+`terminal.rs` 使用 Crossterm/Ratatui，负责 raw mode、备用屏幕、绘制、事件读取和恢复。
+它处理 Press/Repeat、忽略 Release，避免某些终端把按下和松开各处理一次。
 
-`ExportService` 只导出单个文件。它拒绝已存在的目标和不存在的父目录，在目标同目录创建
-随机临时文件，通过 restic dump 写入，成功后使用无覆盖持久化。临时对象在错误或取消
-路径中随作用域清理；应用不提供覆盖快捷方式。
+`app.rs` 保存快照、当前目录、选择、焦点、输入模式、预览、状态文本和一个
+`ActiveJob`。目录、搜索、预览和导出在后台执行；新任务取消并替换旧任务，`Esc` 取消当前
+任务。当前没有并发预取或任务优先级队列。`model.rs` 中有会话状态机领域类型，但运行时
+尚未接入手动锁定流程。
 
-### 任务管理
+### 预览、导出和缓存
 
-`jobs.rs` 的 `JobHandle<T>` 包装 Tokio `JoinHandle` 和 `CancellationToken`。
-`App::ActiveJob` 区分目录、搜索、预览和导出任务。
+`PreviewService` 先通过仓库接口把文件读取到 `SessionCache`，然后：
 
-- 当前最多只有一个活动任务。
-- 新操作会取消并替换旧任务。
-- `Esc` 取消活动任务。
-- restic、ffmpeg 和 ffprobe 等待期间收到取消信号后会 kill 并 wait 子进程。
-- `kill_on_drop(true)` 是任务被丢弃或运行时关闭时的补充保护。
+- 文本最多读 2 MiB；
+- 图片由 `image` 解码并交给 `ratatui-image`；
+- ffprobe 读取媒体 JSON，ffmpeg 生成最大 1280 像素宽的视频 PNG 单帧；
+- 音频和未知格式降级为元数据；
+- 源文件超过 512 MiB 时不读取内容。
 
-当前没有独立的优先级队列、并发预取器或可观察的 `JobManager` 服务。
+图形协议查询失败时使用 Unicode half-block。媒体进程只接触已读取的临时文件，不接触
+仓库或密码。
 
-### 缓存
+`ExportService` 拒绝已有目标，在目标同目录建立随机临时文件，读取成功后
+`persist_noclobber`。失败或取消时临时对象由作用域清理。
 
-有两类容易混淆的缓存：
+`SessionCache` 是会话临时目录，容量上限 512 MiB，超限时删除最早注册的文件，退出时
+删除目录；它不是严格按访问时间更新的 LRU。`rustic_core` 和 restic CLI 另有各自的平台
+缓存，生产代码使用其默认位置。
 
-1. **restic 自身缓存**：生产代码没有传 `--no-cache`，因此使用 restic 的平台默认缓存。
-   测试可通过 `with_cache_dir` 隔离缓存目录。
-2. **SessionCache**：仅保存预览源文件和视频帧。它位于系统会话临时目录，默认上限
-   512 MiB，超过上限时按注册先后删除最旧文件，并在正常析构时删除整个临时目录。
+## 进程与库边界
 
-当前没有目录列表缓存、快照内容索引或预取。`SessionCache` 也不是按访问时间更新的严格
-LRU。
-
-## 子进程边界
-
-### restic
-
-产品代码通过参数数组直接启动进程，不经过 shell。允许的仓库子命令固定为：
-
-| 操作 | 命令 | 数据方向 |
+| 能力 | 默认 `rustic` 后端 | `restic-cli` 回退 |
 | --- | --- | --- |
-| 版本检查 | `restic version` | stdout |
-| 快照 | `restic ... snapshots --json` | JSON stdout |
-| 目录 | `restic ... ls --json <snapshot> <path>` | JSON Lines stdout |
-| 搜索 | `restic ... find --json --snapshot <id> <pattern>` | JSON stdout |
-| 读取文件 | `restic ... dump <snapshot> <path>` | stdout 写入本地文件 |
+| 仓库打开/解锁 | 进程内 `rustic_core` | 每个 restic 子进程 |
+| 快照、目录、搜索、读取 | `rustic_core` 只读适配器 | 参数数组启动 restic |
+| 仓库写命令/API | 不暴露、不调用 | 不在白名单 |
+| 媒体元数据/帧 | ffprobe/ffmpeg 子进程 | ffprobe/ffmpeg 子进程 |
 
-仓库命令统一带 `--repo <local-path>`、空 stdin、`RESTIC_PROGRESS_FPS=0` 和子进程专属的
-`RESTIC_PASSWORD`。白名单不包含任何备份、删除、修复或迁移命令。
+所有外部进程通过参数数组启动，不经过 shell，stdin 关闭。CLI 密码只进入对应 restic
+子进程环境；ffmpeg/ffprobe 从不接收密码。
 
-### ffprobe 和 ffmpeg
+## 密码、日志、临时文件和只读安全
 
-两者只读取已经 dump 到会话缓存的本地文件：
-
-- ffprobe 以 JSON 输出格式、时长、码率和音视频流信息。
-- ffmpeg 禁用 stdin，只生成指定时间点的一张缩放 PNG。
-
-媒体工具从不接收仓库密码或仓库路径，也不直接访问仓库。
-
-## 安全约束
-
-### 当前实现
-
-- 密码保存为 `SecretString`，不会写入配置、日志或命令参数。
-- 密码只通过当前 restic 子进程的环境传递；具有足够系统权限的同机进程仍可能观察进程
-  环境，这是 CLI 后端的安全边界。
-- 可选日志只在用户提供 `--log-file` 时启用；错误文本中含 `password`、`secret`、
-  `access_key` 或 `token` 的整行会被替换为 `[redacted]`。
-- 仓库路径、快照 ID、pattern 和文件路径作为独立参数传递，禁止 shell 拼接。
-- 产品操作受只读命令白名单约束；写入仅发生在 restic 自身平台缓存、应用会话临时目录
-  和用户明确选择的导出目标。
-- 导出使用同目录临时文件和无覆盖落盘，避免把半成品暴露为成功结果。
-
-异常断电或强制终止无法保证执行 Rust 析构，因此会话临时目录仍可能需要由操作系统或后续
-清理机制处理；当前没有启动时扫描旧临时目录。
+- 密码由隐藏 TTY 输入一次，不写配置或凭据库。
+- 默认后端把密码交给 `rustic_core` 完成打开后立即清零输入字符串；解锁后的仓库密钥仍
+  按库的会话状态保存在进程内存。
+- CLI 后端用 `SecretString` 保存密码，并只通过 `RESTIC_PASSWORD` 传给当前子进程。
+- 日志只有指定 `--log-file` 才启用；已知敏感字段所在行统一替换为 `[redacted]`。
+- `rustic_core::Repository` 本身也有写 API，但 `RepositoryReader` 不暴露这些能力，当前
+  适配器只调用打开、索引、快照树读取和 dump。真实仓库测试比较操作前后文件内容。
+- 允许的本地写入只有库自身缓存、会话临时目录和用户明确选择的导出目标。
+- 强制终止或断电不能保证 Rust 析构运行，可能遗留系统临时目录；当前没有跨会话扫描。
 
 ## 跨平台与终端兼容原则
 
-- 所有修复必须是解决根因的最小改动，并保持 Windows、Linux、macOS 可移植。
-- 使用 `PathBuf`/`OsString` 和 `Command` 参数数组处理本地路径与进程，不依赖 shell
-  转义或平台命令字符串。
-- 仓库 JSON 按 UTF-8 解析，Rust 字符串保留中文、空格和 Emoji。能否正确绘制还取决于
-  终端的 Unicode 宽度实现与字体覆盖；缺字时不得影响浏览、读取和导出。
-- 密码提示通过跨平台 TTY 写入和隐藏读取实现，不修改全局控制台代码页。
-- 终端图形能力是可选增强；自动查询失败时使用 portable 的 half-block 降级。
-- 终端事件按 Press/Repeat 处理、忽略 Release，不绑定某个终端模拟器。
-- 当前 CI 覆盖 Windows 和 Linux；Windows x64 是 release artifact 门槛。macOS 是设计
-  目标但尚未进入 CI，因此不能表述为已经完整验收。
+- 修复应是解决根因的最小改动，并保持 Windows、Linux、macOS 行为。
+- 本地路径使用 `PathBuf`/`OsString`，进程使用参数数组，不依赖 shell 或控制台代码页。
+- 仓库内文件名以 Unicode 领域字符串传递，中文、空格和 Emoji 已有真实仓库测试。实际
+  字形仍取决于终端字体，缺字不能阻止读取和导出。
+- 默认 backend 当前要求仓库根路径可转换为 UTF-8；中文/Emoji 等有效 Unicode 路径正常。
+  Unix 上含无效 UTF-8 字节的仓库根路径需显式使用 CLI 后端。
+- 密码提示使用跨平台 TTY；键盘事件基于 Press/Repeat/Release 语义，不绑定某一终端。
+- 图形协议是可选增强，查询失败时降级；CI 在 Windows、Linux、macOS 编译和测试。
 
-## 已知目录加载延迟
+## 目录与文件读取延迟
 
-### 现象
+默认后端已经消除了每次进入目录都启动 restic、重复 scrypt 解锁造成的约 0.5 秒固定
+开销。CLI 回退仍保留这一成本。
 
-进入未加载过的目录时，当前环境观察到约 0.5–0.8 秒等待；具体时间随 CPU、仓库、缓存和
-存储而变化。代码中没有人为的 150 ms 停留限制或固定 0.5 秒延时。
+默认后端仍有三类真实成本：
 
-### 根本原因
+- 启动时 `to_indexed_ids()` 读取仓库索引 ID，成本随仓库索引规模增长。
+- 首次访问某个目录时读取对应快照树；一个含数千直接子项的目录需要 O(该层项目数) 时间和
+  一个同规模 `Vec<FileEntry>`，但不会因此加载其所有后代。
+- 首次预览或导出触发 `to_indexed()` 完整内容索引，可能突然增加 CPU、内存和 I/O；完成
+  后会话内复用。索引升级当前不能中途取消，失败后需要重新打开仓库。
 
-每次目录查询都会启动新的 `restic ls` 进程。该进程必须重新打开仓库、用 scrypt 验证
-密码并取得主密钥，再建立本次命令需要的仓库读取状态。restic 的磁盘缓存能减少元数据
-下载和解析，但不会跨进程保留已经解锁的内存会话。TUI 还必须等待子进程结束并完整解析
-JSON 后才替换列表。
+搜索递归遍历所选快照并把匹配结果整体保存在内存。专用仓库工作线程一次只执行一个操作，
+避免多次索引/树读取并发放大资源，但长任务也会让后续任务排队。
 
-因此，这不是 Ratatui 绘制或 80 ms 事件轮询造成的延迟。单纯移除 restic 缓存限制已经
-完成，但不能消除重复进程和重复解锁成本。
-
-### 规模影响和当前边界
-
-带路径的 `restic ls` 默认只列该层，代码也再次过滤为直接子项，因此不会主动预加载整棵
-快照树。一个含数千项目的单层目录仍会创建同规模的 JSON 和 `Vec<FileEntry>`，时间和
-内存约为 O(该层项目数)。搜索则会把所有匹配项一次性保存在内存。
-
-目录预取、目录 LRU 和全快照索引均未实现。全量索引会把成本变为 O(快照总条目数)，不适合
-作为大型仓库的默认最小修复。当前决定先验证能够保持一次打开会话的 `rustic_core` 后端，
-从根因上处理重复解锁，详见迁移文档。
-
+当前没有 150 ms 停留限制、目录预取或目录缓存。大型仓库是否需要有界缓存，应基于性能
+数据另行决定，不能用无界预加载替代。

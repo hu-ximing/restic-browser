@@ -15,7 +15,7 @@ use crate::{
     AppError, Result,
     cache::SessionCache,
     model::{FileEntry, MediaMetadata, PreviewArtifact},
-    restic::ResticClient,
+    repository::RepositoryHandle,
 };
 
 const TEXT_LIMIT: usize = 2 * 1024 * 1024;
@@ -47,7 +47,7 @@ impl PreviewService {
 
     pub async fn preview(
         &self,
-        restic: Arc<ResticClient>,
+        repository: RepositoryHandle,
         snapshot: &str,
         entry: &FileEntry,
         position: Duration,
@@ -76,7 +76,7 @@ impl PreviewService {
             .unwrap_or("bin")
             .to_ascii_lowercase();
         let source = self.cache.allocate(&extension)?;
-        restic
+        repository
             .dump_to_path(snapshot, &entry.path, &source, token.child_token())
             .await?;
 
@@ -373,5 +373,16 @@ mod tests {
         assert_eq!(metadata.duration, Some(12.5));
         assert_eq!(metadata.width, Some(1920));
         assert_eq!(metadata.audio_codec.as_deref(), Some("aac"));
+    }
+
+    #[tokio::test]
+    async fn reports_a_missing_media_dependency() {
+        let service = PreviewService::new(
+            "target/restic-browser-test-missing-ffmpeg",
+            "target/restic-browser-test-missing-ffprobe",
+            SessionCache::new().unwrap(),
+        );
+        let result = service.check_dependencies().await;
+        assert!(matches!(result, Err(AppError::DependencyMissing(_))));
     }
 }

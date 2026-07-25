@@ -1,12 +1,9 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::path::{Path, PathBuf};
 
 use tempfile::Builder;
 use tokio_util::sync::CancellationToken;
 
-use crate::{AppError, Result, restic::ResticClient};
+use crate::{AppError, Result, repository::RepositoryHandle};
 
 #[derive(Debug, Default, Clone)]
 pub struct ExportService;
@@ -14,7 +11,7 @@ pub struct ExportService;
 impl ExportService {
     pub async fn export_file(
         &self,
-        restic: Arc<ResticClient>,
+        repository: RepositoryHandle,
         snapshot: &str,
         source: &str,
         destination: &Path,
@@ -39,7 +36,7 @@ impl ExportService {
             .suffix(".tmp")
             .tempfile_in(parent)?;
         let temporary = temporary.into_temp_path();
-        restic
+        repository
             .dump_to_path(snapshot, source, temporary.as_ref(), token)
             .await?;
         temporary

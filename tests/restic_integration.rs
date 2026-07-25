@@ -5,8 +5,9 @@ use std::{
 };
 
 use restic_browser::{
-    cache::SessionCache, export::ExportService, model::PreviewArtifact, preview::PreviewService,
-    restic::ResticClient,
+    AppError, cache::SessionCache, export::ExportService, model::PreviewArtifact,
+    preview::PreviewService, repository::RepositoryReader, restic::ResticCliClient,
+    rustic::RusticClient,
 };
 use secrecy::SecretString;
 use sha2::{Digest, Sha256};
@@ -17,8 +18,8 @@ const PASSWORD: &str = "restic-browser-test-password";
 
 #[tokio::test]
 async fn real_repository_browse_search_dump_and_export() {
-    if !has_supported_restic() {
-        eprintln!("skipped: restic 0.19.x is not available");
+    if !integration_dependencies_available() {
+        eprintln!("skipped: restic 0.19.x, ffmpeg, or ffprobe is not available");
         return;
     }
 
@@ -38,7 +39,7 @@ async fn real_repository_browse_search_dump_and_export() {
         .expect("write image fixture");
     make_video(&video_path);
 
-    run_restic(&repository, &["init"], None);
+    run_restic(&repository, &["init", "--repository-version", "2"], None);
     run_restic(
         &repository,
         &[
@@ -50,9 +51,17 @@ async fn real_repository_browse_search_dump_and_export() {
         ],
         Some(fixture.path()),
     );
+    let repository_before = repository_manifest(&repository);
 
-    let client = Arc::new(
-        ResticClient::new(
+    let wrong_password = RusticClient::open_with_cache_dir(
+        &repository,
+        "wrong password".to_owned(),
+        Some(fixture.path().join("wrong-password-cache")),
+    );
+    assert!(matches!(wrong_password, Err(AppError::Authentication)));
+
+    let cli_client = Arc::new(
+        ResticCliClient::new(
             "restic",
             &repository,
             SecretString::from(PASSWORD.to_owned()),
@@ -60,22 +69,42 @@ async fn real_repository_browse_search_dump_and_export() {
         .expect("client")
         .with_cache_dir(fixture.path().join("client-cache")),
     );
-    let snapshots = client
+    let cli_snapshots = cli_client
         .list_snapshots(CancellationToken::new())
         .await
         .expect("list snapshots");
-    assert_eq!(snapshots.len(), 1);
+    assert_eq!(cli_snapshots.len(), 1);
 
-    let root = client
+    let rustic_client = Arc::new(
+        RusticClient::open_with_cache_dir(
+            &repository,
+            PASSWORD.to_owned(),
+            Some(fixture.path().join("rustic-cache")),
+        )
+        .expect("rustic client"),
+    );
+    let snapshots = rustic_client
+        .list_snapshots(CancellationToken::new())
+        .await
+        .expect("rustic list snapshots");
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].id, cli_snapshots[0].id);
+
+    let cli_root = cli_client
         .list_directory(&snapshots[0].id, "/", CancellationToken::new())
         .await
-        .expect("list root");
+        .expect("CLI list root");
+    let root = rustic_client
+        .list_directory(&snapshots[0].id, "/", CancellationToken::new())
+        .await
+        .expect("rustic list root");
     assert!(!root.is_empty());
+    assert_eq!(entry_keys(&root), entry_keys(&cli_root));
     let folder_entry = root
         .iter()
         .find(|entry| entry.name == "folder")
         .expect("folder in root listing");
-    let nested = client
+    let nested = rustic_client
         .list_directory(
             &snapshots[0].id,
             &folder_entry.path,
@@ -85,7 +114,7 @@ async fn real_repository_browse_search_dump_and_export() {
         .expect("list nested directory");
     assert!(nested.iter().any(|entry| entry.name == "nested.txt"));
 
-    let matches = client
+    let matches = rustic_client
         .find(&snapshots[0].id, "*.txt", CancellationToken::new())
         .await
         .expect("find text fixture");
@@ -94,10 +123,11 @@ async fn real_repository_browse_search_dump_and_export() {
         .find(|result| result.entry.name == "中文 空格 😀.txt")
         .expect("unicode file in search results");
 
+    assert!(!rustic_client.content_index_ready());
     let exported = fixture.path().join("exported.txt");
     ExportService
         .export_file(
-            Arc::clone(&client),
+            rustic_client.clone(),
             &snapshots[0].id,
             &found.entry.path,
             &exported,
@@ -105,8 +135,21 @@ async fn real_repository_browse_search_dump_and_export() {
         )
         .await
         .expect("export file");
+    assert!(rustic_client.content_index_ready());
     let actual = std::fs::read(exported).expect("read exported file");
     assert_eq!(Sha256::digest(expected), Sha256::digest(actual));
+    let existing_destination = fixture.path().join("exported.txt");
+    let existing = ExportService
+        .export_file(
+            rustic_client.clone(),
+            &snapshots[0].id,
+            &found.entry.path,
+            &existing_destination,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(existing, Err(AppError::DestinationExists(_))));
+    assert_eq!(std::fs::read(existing_destination).unwrap(), expected);
 
     let preview_service = PreviewService::new(
         "ffmpeg",
@@ -120,7 +163,7 @@ async fn real_repository_browse_search_dump_and_export() {
 
     let text_preview = preview_service
         .preview(
-            Arc::clone(&client),
+            rustic_client.clone(),
             &snapshots[0].id,
             &found.entry,
             std::time::Duration::ZERO,
@@ -130,10 +173,16 @@ async fn real_repository_browse_search_dump_and_export() {
         .expect("text preview");
     assert!(matches!(text_preview, PreviewArtifact::Text { .. }));
 
-    let image_match = find_named(&client, &snapshots[0].id, "*.png", "preview image.png").await;
+    let image_match = find_named(
+        &rustic_client,
+        &snapshots[0].id,
+        "*.png",
+        "preview image.png",
+    )
+    .await;
     let image_preview = preview_service
         .preview(
-            Arc::clone(&client),
+            rustic_client.clone(),
             &snapshots[0].id,
             &image_match,
             std::time::Duration::ZERO,
@@ -143,10 +192,16 @@ async fn real_repository_browse_search_dump_and_export() {
         .expect("image preview");
     assert!(matches!(image_preview, PreviewArtifact::Image { .. }));
 
-    let video_match = find_named(&client, &snapshots[0].id, "*.mp4", "preview video.mp4").await;
+    let video_match = find_named(
+        &rustic_client,
+        &snapshots[0].id,
+        "*.mp4",
+        "preview video.mp4",
+    )
+    .await;
     let video_preview = preview_service
         .preview(
-            Arc::clone(&client),
+            rustic_client.clone(),
             &snapshots[0].id,
             &video_match,
             std::time::Duration::from_secs(1),
@@ -163,6 +218,76 @@ async fn real_repository_browse_search_dump_and_export() {
         }
         other => panic!("unexpected video preview: {other:?}"),
     }
+
+    let cancelled_destination = fixture.path().join("cancelled.txt");
+    let cancelled = rustic_client
+        .dump_to_path(
+            &snapshots[0].id,
+            &found.entry.path,
+            &cancelled_destination,
+            {
+                let token = CancellationToken::new();
+                token.cancel();
+                token
+            },
+        )
+        .await;
+    assert!(matches!(cancelled, Err(AppError::Cancelled)));
+    assert!(!cancelled_destination.exists());
+
+    assert_eq!(repository_before, repository_manifest(&repository));
+}
+
+#[tokio::test]
+async fn rustic_reads_repository_format_v1() {
+    if !has_supported_restic() {
+        eprintln!("skipped: restic 0.19.x is not available");
+        return;
+    }
+
+    let fixture = TempDir::new().expect("fixture directory");
+    let repository = fixture.path().join("repository-v1");
+    let source = fixture.path().join("旧格式 😀.txt");
+    let expected = b"repository format v1";
+    std::fs::write(&source, expected).expect("write v1 fixture");
+    run_restic(&repository, &["init", "--repository-version", "1"], None);
+    run_restic(
+        &repository,
+        &["backup", source.file_name().unwrap().to_str().unwrap()],
+        Some(fixture.path()),
+    );
+    let repository_before = repository_manifest(&repository);
+
+    let client = RusticClient::open_with_cache_dir(
+        &repository,
+        PASSWORD.to_owned(),
+        Some(fixture.path().join("rustic-v1-cache")),
+    )
+    .expect("open repository format v1");
+    let snapshots = client
+        .list_snapshots(CancellationToken::new())
+        .await
+        .expect("list v1 snapshots");
+    let root = client
+        .list_directory(&snapshots[0].id, "/", CancellationToken::new())
+        .await
+        .expect("list v1 root");
+    let entry = root
+        .iter()
+        .find(|entry| entry.name == "旧格式 😀.txt")
+        .expect("unicode v1 entry");
+    let destination = fixture.path().join("v1-export.txt");
+    client
+        .dump_to_path(
+            &snapshots[0].id,
+            &entry.path,
+            &destination,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("read v1 file");
+    assert_eq!(std::fs::read(destination).unwrap(), expected);
+    assert_eq!(repository_before, repository_manifest(&repository));
 }
 
 fn has_supported_restic() -> bool {
@@ -174,6 +299,18 @@ fn has_supported_restic() -> bool {
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout).starts_with("restic 0.19.")
         })
+}
+
+fn integration_dependencies_available() -> bool {
+    has_supported_restic() && has_tool("ffmpeg") && has_tool("ffprobe")
+}
+
+fn has_tool(program: &str) -> bool {
+    Command::new(program)
+        .arg("-version")
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn run_restic(repository: &Path, args: &[&str], current_dir: Option<&Path>) {
@@ -197,7 +334,7 @@ fn run_restic(repository: &Path, args: &[&str], current_dir: Option<&Path>) {
 }
 
 async fn find_named(
-    client: &Arc<ResticClient>,
+    client: &Arc<RusticClient>,
     snapshot: &str,
     pattern: &str,
     name: &str,
@@ -210,6 +347,19 @@ async fn find_named(
         .find(|result| result.entry.name == name)
         .expect("named preview fixture")
         .entry
+}
+
+fn entry_keys(entries: &[restic_browser::model::FileEntry]) -> Vec<(String, String, u64)> {
+    entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                format!("{:?}", entry.file_type),
+                entry.size,
+            )
+        })
+        .collect()
 }
 
 fn make_video(destination: &Path) {
@@ -237,4 +387,31 @@ fn make_video(destination: &Path) {
         "ffmpeg fixture failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn repository_manifest(repository: &Path) -> Vec<(String, Vec<u8>)> {
+    fn visit(root: &Path, directory: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+        for entry in std::fs::read_dir(directory).expect("read repository directory") {
+            let entry = entry.expect("read repository entry");
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("repository-relative path")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.push((
+                    relative,
+                    Sha256::digest(std::fs::read(path).unwrap()).to_vec(),
+                ));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(repository, repository, &mut files);
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
 }

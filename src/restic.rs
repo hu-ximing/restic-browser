@@ -16,10 +16,11 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AppError, Result,
     model::{FileEntry, FileType, SearchResult, Snapshot},
+    repository::RepositoryReader,
 };
 
 #[derive(Debug, Clone)]
-pub struct ResticClient {
+pub struct ResticCliClient {
     executable: PathBuf,
     repository: PathBuf,
     password: Arc<SecretString>,
@@ -45,7 +46,7 @@ impl Operation {
     }
 }
 
-impl ResticClient {
+impl ResticCliClient {
     pub fn new(
         executable: impl Into<PathBuf>,
         repository: impl Into<PathBuf>,
@@ -251,6 +252,54 @@ impl ResticClient {
     }
 }
 
+impl RepositoryReader for ResticCliClient {
+    fn list_snapshots(
+        &self,
+        token: CancellationToken,
+    ) -> futures_util::future::BoxFuture<'_, Result<Vec<Snapshot>>> {
+        Box::pin(ResticCliClient::list_snapshots(self, token))
+    }
+
+    fn list_directory(
+        &self,
+        snapshot: &str,
+        path: &str,
+        token: CancellationToken,
+    ) -> futures_util::future::BoxFuture<'_, Result<Vec<FileEntry>>> {
+        let snapshot = snapshot.to_owned();
+        let path = path.to_owned();
+        Box::pin(
+            async move { ResticCliClient::list_directory(self, &snapshot, &path, token).await },
+        )
+    }
+
+    fn find(
+        &self,
+        snapshot: &str,
+        pattern: &str,
+        token: CancellationToken,
+    ) -> futures_util::future::BoxFuture<'_, Result<Vec<SearchResult>>> {
+        let snapshot = snapshot.to_owned();
+        let pattern = pattern.to_owned();
+        Box::pin(async move { ResticCliClient::find(self, &snapshot, &pattern, token).await })
+    }
+
+    fn dump_to_path(
+        &self,
+        snapshot: &str,
+        source: &str,
+        destination: &Path,
+        token: CancellationToken,
+    ) -> futures_util::future::BoxFuture<'_, Result<()>> {
+        let snapshot = snapshot.to_owned();
+        let source = source.to_owned();
+        let destination = destination.to_path_buf();
+        Box::pin(async move {
+            ResticCliClient::dump_to_path(self, &snapshot, &source, &destination, token).await
+        })
+    }
+}
+
 async fn read_all(mut reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).await?;
@@ -279,7 +328,7 @@ fn dependency_error(path: &Path, error: std::io::Error) -> AppError {
     }
 }
 
-fn parse_snapshot(value: &Value) -> Result<Snapshot> {
+pub(crate) fn parse_snapshot(value: &Value) -> Result<Snapshot> {
     let id = string(value, "id")?;
     Ok(Snapshot {
         short_id: value
@@ -315,7 +364,7 @@ fn parse_json_lines(bytes: &[u8]) -> Result<Vec<Value>> {
         .collect()
 }
 
-fn parse_file_entry(value: &Value) -> Result<Option<FileEntry>> {
+pub(crate) fn parse_file_entry(value: &Value) -> Result<Option<FileEntry>> {
     let object_type = value
         .get("struct_type")
         .or_else(|| value.get("object_type"))

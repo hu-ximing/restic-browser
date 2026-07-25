@@ -6,7 +6,7 @@ pub enum AppError {
     Authentication,
     #[error("repository was not found or is not a restic repository")]
     RepositoryNotFound,
-    #[error("restic repository format is not supported by this restic version")]
+    #[error("restic repository format is not supported by the selected backend")]
     RepositoryFormat,
     #[error("required dependency is unavailable: {0}")]
     DependencyMissing(String),
