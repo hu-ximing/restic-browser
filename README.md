@@ -1,79 +1,42 @@
 # restic-browser
 
-`restic-browser` 是一个 Windows x64 优先的只读 TUI，用来浏览本地 restic
-仓库、搜索快照中的文件、预览文本/图片/视频帧，并安全导出单个文件。
+`restic-browser` 是一个只读 TUI，用来浏览本地 restic 仓库、搜索快照、预览文本、图片
+和视频帧，并安全导出单个文件。Windows x64 是当前发布优先级；代码遵循 Windows、Linux、
+macOS 的跨平台约束。
 
-v0.1 只会调用以下 restic 命令：
+## 当前实现
 
-- `version`
-- `snapshots`
-- `ls`
-- `find`
-- `dump`
+- 后端：外部 restic 0.19.x CLI，只允许 `version`、`snapshots`、`ls`、`find`、`dump`。
+- 预览：文本、常见图片、视频指定时间帧；ffmpeg 和 ffprobe 是外部依赖。
+- 安全：一次运行输入一次密码；不持久化密码；导出单文件且拒绝覆盖。
+- 范围：仅本地仓库，不提供备份、删除、修复或迁移仓库的功能。
 
-它不会执行备份、删除、修复、迁移或其他可能修改仓库的操作。
-
-## 依赖
-
-- Windows x64
-- restic 0.19.x
-- ffmpeg 和 ffprobe
-
-这些工具必须已经安装并可从 `PATH` 找到，也可以使用命令行参数指定路径。
-发布包只包含 `restic-browser.exe`，不会捆绑上述外部工具。
-
-## 使用
+运行当前版本需要预先安装 restic 0.19.x、ffmpeg 和 ffprobe，或通过参数指定它们的路径。
 
 ```powershell
 restic-browser.exe -r D:\backup\restic-repo
 ```
 
-也可以设置 `RESTIC_REPOSITORY`，或显式指定工具：
+也可通过 `RESTIC_REPOSITORY` 提供仓库，并使用 `--restic`、`--ffmpeg`、
+`--ffprobe` 指定工具路径；`--log-file` 启用脱敏诊断日志。
 
-```powershell
-restic-browser.exe `
-  --repository D:\backup\restic-repo `
-  --restic C:\tools\restic.exe `
-  --ffmpeg C:\tools\ffmpeg.exe `
-  --ffprobe C:\tools\ffprobe.exe
-```
+## 计划中的迁移
 
-程序启动后只询问一次密码。密码仅存在于当前进程内存中，并通过当前 restic
-子进程的环境传递；不会写入配置、日志或命令参数。
+项目已决定在独立阶段验证 `rustic_core`，以复用一次打开的仓库会话并改善目录加载延迟。
+该迁移**尚未实现**；`rustic_core` 是第三方 Rust 实现，不是 restic 官方 SDK。验证期间
+保留当前 CLI 后端作为对照和回退。
 
-可选的 `--log-file <path>` 会写入脱敏诊断日志。
+## 文档
 
-## 按键
+- [v0.1 产品目标、流程、键位和验收](docs/product-v0.1.md)
+- [当前架构、安全边界和已知目录延迟](docs/architecture.md)
+- [`rustic_core` 分阶段迁移方案](docs/rustic-core-migration.md)
 
-| 按键 | 操作 |
-| --- | --- |
-| `Tab` | 在快照和文件列表之间切换 |
-| `Enter` | 打开快照、进入目录或预览文件 |
-| `Backspace` | 返回上级目录 |
-| `/` | 在当前快照中按 restic pattern 搜索 |
-| `p` | 预览当前文件 |
-| `←` / `→` | 视频帧后退/前进 5 秒 |
-| `e` | 导出当前单文件；目标存在时拒绝覆盖 |
-| `r` | 刷新当前目录 |
-| `Esc` | 取消当前任务 |
-| `q` | 安全退出并恢复终端 |
-
-图片显示会自动尝试终端图形协议；不可用时降级为 Unicode half-block 或元数据。
-文本预览上限为 2 MiB。媒体源超过 512 MiB 时只显示元数据。
-
-## 构建与检查
+## 构建
 
 ```powershell
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo build --release
+cargo test --locked
+cargo build --release --locked
 ```
-
-真实仓库集成测试会在系统存在 restic 0.19.x 时临时执行 `init` 和 `backup`
-来生成测试夹具；产品代码仍然只使用只读命令。
-
-## v0.1 边界
-
-本版本不支持远程仓库配置、目录或多选导出、跨快照比较、PDF 页面、音频播放、
-系统凭据库、仓库健康检查和安装器。
