@@ -118,6 +118,7 @@ pub struct App {
     tree_path: String,
     tree_offset: usize,
     tree_page_len: usize,
+    pending_tree_reveal: Option<String>,
     focus: Focus,
     wide_layout: bool,
     input_mode: InputMode,
@@ -163,6 +164,7 @@ impl App {
             tree_path: "/".to_owned(),
             tree_offset: 0,
             tree_page_len: 0,
+            pending_tree_reveal: None,
             focus: Focus::Snapshots,
             wide_layout: false,
             input_mode: InputMode::Normal,
@@ -197,7 +199,10 @@ impl App {
         match job {
             ActiveJob::Directory(job) => match job.finish().await {
                 Ok(load) => self.finish_directory_load(load),
-                Err(error) => self.show_error(error),
+                Err(error) => {
+                    self.pending_tree_reveal = None;
+                    self.show_error(error);
+                }
             },
             ActiveJob::Search(job) => match job.finish().await {
                 Ok(results) => {
@@ -381,7 +386,7 @@ impl App {
     fn activate_selection(&mut self) {
         match self.focus {
             Focus::Snapshots => self.activate_snapshot(),
-            Focus::Directories => self.browse_directory(self.tree_path.clone()),
+            Focus::Directories => self.browse_tree_directory(self.tree_path.clone()),
             Focus::Files => {
                 let Some(entry) = self.entries.get(self.entry_index).cloned() else {
                     return;
@@ -410,6 +415,7 @@ impl App {
             self.expanded_directories.clear();
             self.tree_path = "/".to_owned();
             self.tree_offset = 0;
+            self.pending_tree_reveal = None;
             self.clear_preview();
             self.start_directory_load("/".to_owned(), DirectoryLoadPurpose::Browse, false);
         }
@@ -464,6 +470,12 @@ impl App {
     }
 
     fn browse_directory(&mut self, path: String) {
+        self.pending_tree_reveal = None;
+        self.start_directory_load(path, DirectoryLoadPurpose::Browse, true);
+    }
+
+    fn browse_tree_directory(&mut self, path: String) {
+        self.pending_tree_reveal = Some(path.clone());
         self.start_directory_load(path, DirectoryLoadPurpose::Browse, true);
     }
 
@@ -522,6 +534,7 @@ impl App {
                 self.current_path = load.path.clone();
                 self.tree_path = load.path.clone();
                 self.reveal_tree_path(&load.path);
+                self.pending_tree_reveal = Some(load.path.clone());
                 self.entries = load.entries;
                 if let Some(parent) = parent_repository_path(&load.path) {
                     self.entries.insert(0, parent_entry(parent));
@@ -529,9 +542,6 @@ impl App {
                 self.entry_index = 0;
                 self.entry_offset = 0;
                 self.status = format!("已加载 {count} 个项目");
-                if self.focus == Focus::Directories {
-                    self.adjust_tree_view_for_children(&load.path);
-                }
             }
             DirectoryLoadPurpose::Expand => {
                 self.expanded_directories.insert(load.path);
@@ -548,10 +558,18 @@ impl App {
         }
     }
 
-    fn adjust_tree_view_for_children(&mut self, path: &str) {
-        if self.tree_page_len == 0 {
+    fn adjust_pending_tree_view(&mut self, page_len: usize) {
+        self.tree_page_len = page_len;
+        let Some(path) = self.pending_tree_reveal.clone() else {
+            return;
+        };
+        if page_len == 0
+            || !self.directory_cache.contains_key(&path)
+            || !self.expanded_directories.contains(&path)
+        {
             return;
         }
+        self.pending_tree_reveal = None;
         let rows = self.tree_rows();
         let Some(selected) = rows.iter().position(|row| row.path == path) else {
             return;
@@ -568,11 +586,9 @@ impl App {
         let Some(last_child) = last_child else {
             return;
         };
-        let visible_bottom = self
-            .tree_offset
-            .saturating_add(self.tree_page_len.saturating_sub(1));
+        let visible_bottom = self.tree_offset.saturating_add(page_len.saturating_sub(1));
         if last_child > visible_bottom {
-            let required_offset = last_child + 1 - self.tree_page_len;
+            let required_offset = last_child + 1 - page_len;
             self.tree_offset = self
                 .tree_offset
                 .max(required_offset.min(selected))
@@ -589,6 +605,7 @@ impl App {
             return;
         };
         self.replace_job();
+        self.pending_tree_reveal = None;
         self.clear_preview();
         self.status = format!("正在搜索 {pattern}…");
         let client = Arc::clone(&self.repository);
@@ -896,6 +913,7 @@ fn render_snapshots(frame: &mut Frame<'_>, app: &mut App, area: Rect, condensed:
 }
 
 fn render_directory_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    app.adjust_pending_tree_view(usize::from(area.height.saturating_sub(2)));
     let rows = app.tree_rows();
     let path_rows = rows
         .iter()
@@ -979,7 +997,6 @@ fn render_directory_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         None
     };
-    app.tree_page_len = usize::from(area.height.saturating_sub(2));
     let mut state = ListState::default()
         .with_selected(selected)
         .with_offset(app.tree_offset);
@@ -2124,12 +2141,13 @@ mod tests {
         );
         app.focus = Focus::Directories;
         app.tree_path = "/d5".to_owned();
-        app.tree_page_len = 8;
         let rows = app.tree_rows();
         assert_eq!(rows[1].prefix, "├── ");
         assert_eq!(rows[7].prefix, "└── ");
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.focus = Focus::Files;
+        app.adjust_pending_tree_view(8);
 
         let selected = app
             .tree_rows()
@@ -2151,7 +2169,10 @@ mod tests {
                 })
                 .collect(),
         );
+        app.focus = Focus::Directories;
+        app.tree_path = "/d5".to_owned();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.adjust_pending_tree_view(8);
 
         let rows = app.tree_rows();
         let last_child = rows
@@ -2160,6 +2181,52 @@ mod tests {
             .unwrap();
         assert_eq!(app.tree_offset, 2);
         assert!(last_child < app.tree_offset + app.tree_page_len);
+    }
+
+    #[tokio::test]
+    async fn opening_a_directory_from_files_also_scrolls_its_tree_children_into_view() {
+        let mut app = test_app(vec![test_snapshot('a')]);
+        app.set_wide_layout(true);
+        app.finish_directory_load(super::DirectoryLoad {
+            path: "/".to_owned(),
+            entries: (0..7)
+                .map(|index| {
+                    test_entry(
+                        &format!("d{index}"),
+                        &format!("/d{index}"),
+                        FileType::Directory,
+                    )
+                })
+                .collect(),
+            purpose: super::DirectoryLoadPurpose::Browse,
+        });
+        app.directory_cache.insert(
+            "/d5".to_owned(),
+            (0..50)
+                .map(|index| {
+                    test_entry(
+                        &format!("child{index}"),
+                        &format!("/d5/child{index}"),
+                        FileType::Directory,
+                    )
+                })
+                .collect(),
+        );
+        app.focus = Focus::Files;
+        app.entry_index = 5;
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let selected = app
+            .tree_rows()
+            .iter()
+            .position(|row| row.path == "/d5")
+            .unwrap();
+        assert_eq!(app.current_path, "/d5");
+        assert_eq!(app.tree_offset, selected);
     }
 
     #[tokio::test]
