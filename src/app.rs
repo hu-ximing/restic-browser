@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
         Wrap,
@@ -273,8 +273,14 @@ impl App {
             KeyCode::PageUp => self.page_selection(false),
             KeyCode::PageDown => self.page_selection(true),
             KeyCode::Enter => self.activate_selection(),
-            KeyCode::Backspace | KeyCode::Left => match self.focus {
+            KeyCode::Backspace => match self.focus {
                 Focus::Directories => self.collapse_tree_selection(),
+                Focus::Files => self.go_parent(),
+                Focus::Snapshots => {}
+            },
+            KeyCode::Left => match self.focus {
+                Focus::Directories => self.collapse_tree_selection(),
+                Focus::Files if self.current_path == "/" => self.focus = Focus::Snapshots,
                 Focus::Files => self.go_parent(),
                 Focus::Snapshots => {}
             },
@@ -764,9 +770,9 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
         render_preview(frame, app, content[1]);
     }
     let shortcuts = if wide_layout {
-        " ` 快照  Tab 目录树  Space 文件  PgUp/PgDn 翻页  Enter 打开  ←/→ 导航  / 搜索  p 预览  e 导出  r 刷新  q 退出"
+        " [`]快照 [Tab]目录树 [Space]文件 [PgUp]/[PgDn]翻页 [Enter]打开 [←]/[→]导航 [/]搜索 [p]预览 [e]导出 [r]刷新 [q]退出"
     } else {
-        " ` 快照  Space 文件  PgUp/PgDn 翻页  Enter 打开  ←/→ 导航  / 搜索  p 预览  e 导出  r 刷新  q 退出"
+        " [`]快照 [Space]文件 [PgUp]/[PgDn]翻页 [Enter]打开 [←]/[→]导航 [/]搜索 [p]预览 [e]导出 [r]刷新 [q]退出"
     };
     frame.render_widget(
         Paragraph::new(shortcuts)
@@ -845,17 +851,59 @@ fn render_snapshots(frame: &mut Frame<'_>, app: &mut App, area: Rect, condensed:
 
 fn render_directory_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let rows = app.tree_rows();
-    let items = rows.iter().map(|row| {
-        let style = if row.path == app.current_path {
+    let path_rows = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.path == app.current_path || is_repository_ancestor(&row.path, &app.current_path)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut route_cells = HashSet::new();
+    for pair in path_rows.windows(2) {
+        let [ancestor, child] = pair else {
+            continue;
+        };
+        let segment = rows[*child].depth.saturating_sub(1);
+        for row_index in ancestor + 1..=*child {
+            route_cells.insert((row_index, segment));
+        }
+    }
+    let items = rows.iter().enumerate().map(|(row_index, row)| {
+        let on_path =
+            row.path == app.current_path || is_repository_ancestor(&row.path, &app.current_path);
+        let path_style = if row.path == app.current_path {
             Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::BOLD)
-        } else if is_repository_ancestor(&row.path, &app.current_path) {
-            Style::default().fg(Color::Blue)
         } else {
-            Style::default()
+            Style::default().fg(Color::Blue)
         };
-        ListItem::new(Line::styled(format!("{}{}", row.prefix, row.name), style))
+        let mut spans = Vec::new();
+        let prefix = row.prefix.chars().collect::<Vec<_>>();
+        for (segment_index, segment) in prefix.chunks(4).enumerate() {
+            let segment = segment.iter().collect::<String>();
+            if on_path && segment_index + 1 == row.depth {
+                spans.push(Span::styled(segment, path_style));
+            } else if route_cells.contains(&(row_index, segment_index)) {
+                let mut characters = segment.chars();
+                if let Some(junction) = characters.next() {
+                    spans.push(Span::styled(
+                        junction.to_string(),
+                        Style::default().fg(Color::Blue),
+                    ));
+                    spans.push(Span::raw(characters.collect::<String>()));
+                }
+            } else {
+                spans.push(Span::raw(segment));
+            }
+        }
+        if on_path {
+            spans.push(Span::styled(row.name.clone(), path_style));
+        } else {
+            spans.push(Span::raw(row.name.clone()));
+        }
+        ListItem::new(Line::from(spans))
     });
     let border = if app.focus == Focus::Directories {
         Color::Cyan
@@ -1496,8 +1544,10 @@ mod tests {
             let rendered = rendered_text(terminal.backend());
             assert!(rendered.contains("文 件 ："));
             assert!(rendered.contains("预 览"));
+            assert!(rendered.contains("[`]"));
             assert_eq!(rendered.contains("目 录 树"), wide);
             if wide {
+                assert!(rendered.contains("[Tab]"));
                 app.focus = Focus::Directories;
             } else {
                 assert_ne!(app.focus, Focus::Directories);
@@ -1574,6 +1624,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tree_colors_only_the_directory_name_and_its_direct_connector() {
+        let mut app = test_app(vec![test_snapshot('a')]);
+        app.finish_directory_load(super::DirectoryLoad {
+            path: "/".to_owned(),
+            entries: vec![
+                test_entry("Pparent", "/Pparent", FileType::Directory),
+                test_entry("Xother", "/Xother", FileType::Directory),
+            ],
+            purpose: super::DirectoryLoadPurpose::Browse,
+        });
+        app.directory_cache.insert(
+            "/Pparent".to_owned(),
+            vec![test_entry(
+                "Qcurrent",
+                "/Pparent/Qcurrent",
+                FileType::Directory,
+            )],
+        );
+        app.finish_directory_load(super::DirectoryLoad {
+            path: "/Pparent/Qcurrent".to_owned(),
+            entries: Vec::new(),
+            purpose: super::DirectoryLoadPurpose::Browse,
+        });
+        app.focus = Focus::Files;
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let tree_area = Rect::new(0, 16, 29, 21);
+        let (name_x, row_y) = find_symbol(terminal.backend(), tree_area, "Q");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer.cell((name_x, row_y)).unwrap().fg, Color::Blue);
+        assert_eq!(buffer.cell((name_x - 4, row_y)).unwrap().symbol(), "└");
+        assert_eq!(buffer.cell((name_x - 4, row_y)).unwrap().fg, Color::Blue);
+        assert_eq!(buffer.cell((name_x - 8, row_y)).unwrap().symbol(), "│");
+        assert_eq!(buffer.cell((name_x - 8, row_y)).unwrap().fg, Color::Reset);
+    }
+
+    #[tokio::test]
+    async fn tree_colors_vertical_route_through_rows_before_the_current_directory() {
+        let mut app = test_app(vec![test_snapshot('a')]);
+        app.finish_directory_load(super::DirectoryLoad {
+            path: "/".to_owned(),
+            entries: vec![test_entry("D", "/D", FileType::Directory)],
+            purpose: super::DirectoryLoadPurpose::Browse,
+        });
+        app.directory_cache.insert(
+            "/D".to_owned(),
+            vec![
+                test_entry("Abranch", "/D/Abranch", FileType::Directory),
+                test_entry("Notes", "/D/Notes", FileType::Directory),
+            ],
+        );
+        app.directory_cache.insert(
+            "/D/Abranch".to_owned(),
+            vec![test_entry("Leaf", "/D/Abranch/Leaf", FileType::Directory)],
+        );
+        app.expanded_directories.insert("/D/Abranch".to_owned());
+        app.finish_directory_load(super::DirectoryLoad {
+            path: "/D/Notes".to_owned(),
+            entries: Vec::new(),
+            purpose: super::DirectoryLoadPurpose::Browse,
+        });
+        app.focus = Focus::Files;
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let tree_area = Rect::new(0, 16, 29, 21);
+        let (name_x, row_y) = find_symbol(terminal.backend(), tree_area, "L");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer.cell((name_x - 8, row_y)).unwrap().symbol(), "│");
+        assert_eq!(buffer.cell((name_x - 8, row_y)).unwrap().fg, Color::Blue);
+        assert_eq!(buffer.cell((name_x - 4, row_y)).unwrap().symbol(), "└");
+        assert_eq!(buffer.cell((name_x - 4, row_y)).unwrap().fg, Color::Reset);
+        assert_eq!(buffer.cell((name_x, row_y)).unwrap().fg, Color::Reset);
+    }
+
+    #[tokio::test]
     async fn horizontal_arrows_navigate_directories_but_do_not_preview_files() {
         let repository = tempfile::tempdir().unwrap();
         let client = Arc::new(
@@ -1641,6 +1772,10 @@ mod tests {
 
         app.current_path = "/".to_owned();
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Snapshots);
+
+        app.focus = Focus::Files;
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Files);
     }
 
