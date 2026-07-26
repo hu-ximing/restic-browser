@@ -6,8 +6,9 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use restic_browser::{
-    AppError, Result, app::App, cache::SessionCache, error::redact, preview::PreviewService,
-    repository::RepositoryHandle, restic::ResticCliClient, rustic::RusticClient, terminal,
+    AppError, Result, app::App, cache::SessionCache, error::redact, language::Language,
+    preview::PreviewService, repository::RepositoryHandle, restic::ResticCliClient,
+    rustic::RusticClient, terminal,
 };
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -21,7 +22,7 @@ enum Backend {
 #[command(
     name = "restic-browser",
     version,
-    about = "只读浏览 restic 快照、预览并导出文件或恢复目录"
+    about = "Browse restic snapshots, preview and export files, or restore directories (read-only)"
 )]
 struct Cli {
     #[arg(short = 'r', long, env = "RESTIC_REPOSITORY")]
@@ -36,6 +37,9 @@ struct Cli {
     ffprobe: PathBuf,
     #[arg(long)]
     log_file: Option<PathBuf>,
+    /// Display the interface in Chinese.
+    #[arg(long)]
+    cn: bool,
 }
 
 #[tokio::main]
@@ -48,10 +52,18 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    init_logging(cli.log_file.as_ref())?;
-    let repository = cli
-        .repository
-        .ok_or_else(|| AppError::Other("请使用 --repository 指定本地仓库".to_owned()))?;
+    let language = Language::from_chinese_flag(cli.cn);
+    init_logging(cli.log_file.as_ref(), language)?;
+    let repository = cli.repository.ok_or_else(|| {
+        AppError::Other(
+            language
+                .text(
+                    "specify a local repository with --repository",
+                    "请使用 --repository 指定本地仓库",
+                )
+                .to_owned(),
+        )
+    })?;
 
     if matches!(cli.backend, Backend::ResticCli) {
         ResticCliClient::check_version(&cli.restic).await?;
@@ -59,7 +71,8 @@ async fn run() -> Result<()> {
     let cache = SessionCache::new()?;
     let preview_service = PreviewService::new(cli.ffmpeg, cli.ffprobe, cache);
 
-    rtoolbox::print_tty::print_tty("仓库密码: ").map_err(AppError::Io)?;
+    rtoolbox::print_tty::print_tty(language.text("Repository password: ", "仓库密码: "))
+        .map_err(AppError::Io)?;
     let password = rpassword::read_password().map_err(AppError::Io)?;
     let (client, restore_client): (RepositoryHandle, Arc<ResticCliClient>) = match cli.backend {
         Backend::Rustic => {
@@ -89,11 +102,17 @@ async fn run() -> Result<()> {
             tracing::error!("{}", redact(&error.to_string()));
         })?;
 
-    let app = App::new(client, restore_client, Arc::new(preview_service), snapshots);
+    let app = App::new(
+        client,
+        restore_client,
+        Arc::new(preview_service),
+        snapshots,
+        language,
+    );
     terminal::run(app).await
 }
 
-fn init_logging(path: Option<&PathBuf>) -> Result<()> {
+fn init_logging(path: Option<&PathBuf>, language: Language) -> Result<()> {
     let Some(path) = path else {
         return Ok(());
     };
@@ -106,6 +125,30 @@ fn init_logging(path: Option<&PathBuf>) -> Result<()> {
                 .expect("diagnostic log file should remain available")
         })
         .try_init()
-        .map_err(|error| AppError::Other(format!("无法启用日志：{error}")))?;
+        .map_err(|error| {
+            AppError::Other(format!(
+                "{}: {error}",
+                language.text("failed to enable logging", "无法启用日志")
+            ))
+        })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interface_language_defaults_to_english() {
+        let cli = Cli::try_parse_from(["restic-browser"]).unwrap();
+
+        assert!(!cli.cn);
+    }
+
+    #[test]
+    fn cn_flag_enables_chinese() {
+        let cli = Cli::try_parse_from(["restic-browser", "--cn"]).unwrap();
+
+        assert!(cli.cn);
+    }
 }

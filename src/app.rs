@@ -22,6 +22,7 @@ use crate::{
     AppError,
     export::ExportService,
     jobs::JobHandle,
+    language::Language,
     model::{FileEntry, FileType, PreviewArtifact, SearchResult, Snapshot},
     preview::PreviewService,
     repository::RepositoryHandle,
@@ -130,6 +131,7 @@ pub struct App {
     picker: Picker,
     video_position: Duration,
     should_quit: bool,
+    language: Language,
 }
 
 impl App {
@@ -138,6 +140,7 @@ impl App {
         restore_client: Arc<ResticCliClient>,
         preview_service: Arc<PreviewService>,
         snapshots: Vec<Snapshot>,
+        language: Language,
     ) -> Self {
         let picker = if cfg!(test) {
             Picker::halfblocks()
@@ -168,7 +171,7 @@ impl App {
             focus: Focus::Snapshots,
             wide_layout: false,
             input_mode: InputMode::Normal,
-            status: "就绪".to_owned(),
+            status: language.text("Ready", "就绪").to_owned(),
             active_job: None,
             preview: None,
             preview_entry: None,
@@ -176,6 +179,7 @@ impl App {
             picker,
             video_position: Duration::ZERO,
             should_quit: false,
+            language,
         };
         app.browse_directory("/".to_owned());
         app
@@ -209,23 +213,43 @@ impl App {
                     self.entries = results.into_iter().map(|result| result.entry).collect();
                     self.entry_index = 0;
                     self.entry_offset = 0;
-                    self.status = format!("找到 {} 个项目", self.entries.len());
+                    self.status = format!(
+                        "{} {} {}",
+                        self.language.text("Found", "找到"),
+                        self.entries.len(),
+                        self.language.text("items", "个项目")
+                    );
                 }
                 Err(error) => self.show_error(error),
             },
             ActiveJob::Preview(job) => match job.finish().await {
                 Ok(preview) => {
                     self.set_preview(preview);
-                    self.status = "预览已就绪".to_owned();
+                    self.status = self
+                        .language
+                        .text("Preview is ready", "预览已就绪")
+                        .to_owned();
                 }
                 Err(error) => self.show_error(error),
             },
             ActiveJob::Export(job) => match job.finish().await {
-                Ok(path) => self.status = format!("已导出到 {}", path.display()),
+                Ok(path) => {
+                    self.status = format!(
+                        "{} {}",
+                        self.language.text("Exported to", "已导出到"),
+                        path.display()
+                    )
+                }
                 Err(error) => self.show_error(error),
             },
             ActiveJob::Restore(job) => match job.finish().await {
-                Ok(path) => self.status = format!("已恢复到 {}", path.display()),
+                Ok(path) => {
+                    self.status = format!(
+                        "{} {}",
+                        self.language.text("Restored to", "已恢复到"),
+                        path.display()
+                    )
+                }
                 Err(error) => self.show_error(error),
             },
         }
@@ -270,7 +294,7 @@ impl App {
     pub fn cancel_active_job(&mut self) {
         if let Some(job) = &self.active_job {
             job.cancel();
-            self.status = "正在取消…".to_owned();
+            self.status = self.language.text("Cancelling…", "正在取消…").to_owned();
         }
     }
 
@@ -305,7 +329,13 @@ impl App {
             KeyCode::Char('e') => {
                 if let Some(entry) = self.selected_file() {
                     if is_parent_entry(entry) {
-                        self.status = "不能导出上级目录项".to_owned();
+                        self.status = self
+                            .language
+                            .text(
+                                "The parent directory entry cannot be exported",
+                                "不能导出上级目录项",
+                            )
+                            .to_owned();
                     } else {
                         self.input_mode = InputMode::Export(".".to_owned());
                     }
@@ -402,7 +432,10 @@ impl App {
 
     fn activate_snapshot(&mut self) {
         if self.snapshots.is_empty() {
-            self.status = "仓库中没有快照".to_owned();
+            self.status = self
+                .language
+                .text("The repository has no snapshots", "仓库中没有快照")
+                .to_owned();
             return;
         }
         if self.snapshot_index != self.active_snapshot_index {
@@ -505,13 +538,16 @@ impl App {
             return;
         }
         let Some(snapshot) = self.selected_snapshot().cloned() else {
-            self.status = "仓库中没有快照".to_owned();
+            self.status = self
+                .language
+                .text("The repository has no snapshots", "仓库中没有快照")
+                .to_owned();
             return;
         };
         if matches!(purpose, DirectoryLoadPurpose::Expand) {
             self.replace_job();
         }
-        self.status = format!("正在加载 {path}…");
+        self.status = format!("{} {path}…", self.language.text("Loading", "正在加载"));
         let client = Arc::clone(&self.repository);
         self.active_job = Some(ActiveJob::Directory(JobHandle::spawn_cancellable(
             move |token| async move {
@@ -541,11 +577,19 @@ impl App {
                 }
                 self.entry_index = 0;
                 self.entry_offset = 0;
-                self.status = format!("已加载 {count} 个项目");
+                self.status = format!(
+                    "{} {count} {}",
+                    self.language.text("Loaded", "已加载"),
+                    self.language.text("items", "个项目")
+                );
             }
             DirectoryLoadPurpose::Expand => {
                 self.expanded_directories.insert(load.path);
-                self.status = format!("已加载 {count} 个项目");
+                self.status = format!(
+                    "{} {count} {}",
+                    self.language.text("Loaded", "已加载"),
+                    self.language.text("items", "个项目")
+                );
             }
         }
     }
@@ -598,7 +642,10 @@ impl App {
 
     fn start_search(&mut self, pattern: String) {
         if pattern.trim().is_empty() {
-            self.status = "搜索模式不能为空".to_owned();
+            self.status = self
+                .language
+                .text("The search pattern cannot be empty", "搜索模式不能为空")
+                .to_owned();
             return;
         }
         let Some(snapshot) = self.selected_snapshot().cloned() else {
@@ -607,7 +654,7 @@ impl App {
         self.replace_job();
         self.pending_tree_reveal = None;
         self.clear_preview();
-        self.status = format!("正在搜索 {pattern}…");
+        self.status = format!("{} {pattern}…", self.language.text("Searching", "正在搜索"));
         let client = Arc::clone(&self.repository);
         self.active_job = Some(ActiveJob::Search(JobHandle::spawn_cancellable(
             move |token| async move { client.find(&snapshot.id, &pattern, token).await },
@@ -622,14 +669,28 @@ impl App {
             return;
         };
         if entry.is_dir() {
-            self.status = "只能预览文件".to_owned();
+            self.status = self
+                .language
+                .text("Only files can be previewed", "只能预览文件")
+                .to_owned();
             return;
         }
         self.replace_job();
         self.status = if self.repository.content_index_ready() {
-            format!("正在预览 {}…", entry.name)
+            format!(
+                "{} {}…",
+                self.language.text("Previewing", "正在预览"),
+                entry.name
+            )
         } else {
-            format!("首次读取：正在建立文件索引并预览 {}…", entry.name)
+            format!(
+                "{} {}…",
+                self.language.text(
+                    "First read: building the file index and previewing",
+                    "首次读取：正在建立文件索引并预览",
+                ),
+                entry.name
+            )
         };
         let service = Arc::clone(&self.preview_service);
         let client = Arc::clone(&self.repository);
@@ -652,11 +713,20 @@ impl App {
             return;
         };
         if directory_input.is_empty() {
-            self.status = "导出目录不能为空".to_owned();
+            self.status = self
+                .language
+                .text("The export directory cannot be empty", "导出目录不能为空")
+                .to_owned();
             return;
         }
         if is_parent_entry(&entry) {
-            self.status = "不能导出上级目录项".to_owned();
+            self.status = self
+                .language
+                .text(
+                    "The parent directory entry cannot be exported",
+                    "不能导出上级目录项",
+                )
+                .to_owned();
             return;
         }
         let directory = match expand_home_path(&directory_input, dirs::home_dir().as_deref()) {
@@ -675,7 +745,11 @@ impl App {
         };
         self.replace_job();
         if entry.is_dir() {
-            self.status = format!("正在恢复 {}…", entry.name);
+            self.status = format!(
+                "{} {}…",
+                self.language.text("Restoring", "正在恢复"),
+                entry.name
+            );
             let client = Arc::clone(&self.restore_client);
             self.active_job = Some(ActiveJob::Restore(JobHandle::spawn_cancellable(
                 move |token| async move {
@@ -687,9 +761,20 @@ impl App {
             return;
         }
         self.status = if self.repository.content_index_ready() {
-            format!("正在导出 {}…", entry.name)
+            format!(
+                "{} {}…",
+                self.language.text("Exporting", "正在导出"),
+                entry.name
+            )
         } else {
-            format!("首次读取：正在建立文件索引并导出 {}…", entry.name)
+            format!(
+                "{} {}…",
+                self.language.text(
+                    "First read: building the file index and exporting",
+                    "首次读取：正在建立文件索引并导出",
+                ),
+                entry.name
+            )
         };
         let client = Arc::clone(&self.repository);
         let service = self.export_service.clone();
@@ -791,7 +876,7 @@ impl App {
     }
 
     fn show_error(&mut self, error: AppError) {
-        self.status = format!("错误：{error}");
+        self.status = format!("{}: {error}", self.language.text("Error", "错误"));
     }
 }
 
@@ -832,9 +917,15 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
         render_preview(frame, app, content[1]);
     }
     let shortcuts = if wide_layout {
-        " [`]快照 [Tab]目录树 [Space]文件 [PgUp]/[PgDn]翻页 [Enter]打开 [←]/[→]导航 [/]搜索 [p]预览 [e]导出 [r]刷新 [q]退出"
+        app.language.text(
+            " [`]Snapshots [Tab]Tree [Space]Files [PgUp]/[PgDn]Page [Enter]Open [←]/[→]Navigate [/]Search [p]Preview [e]Export [r]Refresh [q]Quit",
+            " [`]快照 [Tab]目录树 [Space]文件 [PgUp]/[PgDn]翻页 [Enter]打开 [←]/[→]导航 [/]搜索 [p]预览 [e]导出 [r]刷新 [q]退出",
+        )
     } else {
-        " [`]快照 [Space]文件 [PgUp]/[PgDn]翻页 [Enter]打开 [←]/[→]导航 [/]搜索 [p]预览 [e]导出 [r]刷新 [q]退出"
+        app.language.text(
+            " [`]Snapshots [Space]Files [PgUp]/[PgDn]Page [Enter]Open [←]/[→]Navigate [/]Search [p]Preview [e]Export [r]Refresh [q]Quit",
+            " [`]快照 [Space]文件 [PgUp]/[PgDn]翻页 [Enter]打开 [←]/[→]导航 [/]搜索 [p]预览 [e]导出 [r]刷新 [q]退出",
+        )
     };
     frame.render_widget(
         Paragraph::new(shortcuts)
@@ -844,12 +935,23 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
         sections[2],
     );
     match &app.input_mode {
-        InputMode::Search(buffer) => render_prompt(frame, "搜索 restic pattern", buffer),
+        InputMode::Search(buffer) => render_prompt(
+            frame,
+            app.language
+                .text("Search restic pattern", "搜索 restic pattern"),
+            buffer,
+        ),
         InputMode::Export(buffer) => {
             let title = if app.selected_file().is_some_and(FileEntry::is_dir) {
-                "恢复目录到父目录（不合并同名目录）"
+                app.language.text(
+                    "Restore directory into parent (do not merge existing directories)",
+                    "恢复目录到父目录（不合并同名目录）",
+                )
             } else {
-                "导出文件到目录（不覆盖同名文件）"
+                app.language.text(
+                    "Export file into directory (do not overwrite existing files)",
+                    "导出文件到目录（不覆盖同名文件）",
+                )
             };
             render_prompt(frame, title, buffer);
         }
@@ -896,7 +998,10 @@ fn render_snapshots(frame: &mut Frame<'_>, app: &mut App, area: Rect, condensed:
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" 快照（最新优先） ")
+                .title(
+                    app.language
+                        .text(" Snapshots (newest first) ", " 快照（最新优先） "),
+                )
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border)),
         )
@@ -983,7 +1088,7 @@ fn render_directory_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" 目录树 ")
+                .title(app.language.text(" Directory tree ", " 目录树 "))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border)),
         )
@@ -1035,17 +1140,33 @@ fn render_files(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ],
     )
     .header(
-        Row::new(["名称", "大小", "修改时间", "类型"]).style(Style::default().fg(Color::Yellow)),
+        Row::new([
+            app.language.text("Name", "名称"),
+            app.language.text("Size", "大小"),
+            app.language.text("Modified", "修改时间"),
+            app.language.text("Type", "类型"),
+        ])
+        .style(Style::default().fg(Color::Yellow)),
     )
     .block(
         Block::default()
-            .title(format!(
-                " 文件：{}（{} 个项目） ",
-                app.current_path,
-                app.entries
-                    .len()
-                    .saturating_sub(usize::from(has_parent_entry(&app.entries)))
-            ))
+            .title(if app.language == Language::Chinese {
+                format!(
+                    " 文件：{}（{} 个项目） ",
+                    app.current_path,
+                    app.entries
+                        .len()
+                        .saturating_sub(usize::from(has_parent_entry(&app.entries)))
+                )
+            } else {
+                format!(
+                    " Files: {} ({} items) ",
+                    app.current_path,
+                    app.entries
+                        .len()
+                        .saturating_sub(usize::from(has_parent_entry(&app.entries)))
+                )
+            })
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border)),
     )
@@ -1068,8 +1189,12 @@ fn render_preview(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .or_else(|| app.selected_file())
         .map(|entry| entry.name.as_str());
     let title = preview_name
-        .map(|name| format!(" 预览：{name} "))
-        .unwrap_or_else(|| " 预览 / 元数据 ".to_owned());
+        .map(|name| format!(" {}: {name} ", app.language.text("Preview", "预览")))
+        .unwrap_or_else(|| {
+            app.language
+                .text(" Preview / metadata ", " 预览 / 元数据 ")
+                .to_owned()
+        });
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1077,11 +1202,14 @@ fn render_preview(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let entry_details = app
         .preview_entry
         .as_ref()
-        .map(|entry| format_entry_details(entry, app.selected_snapshot()))
+        .map(|entry| format_entry_details(entry, app.selected_snapshot(), app.language))
         .unwrap_or_default();
     let visual_details = match &app.preview {
         Some(PreviewArtifact::VideoFrame { metadata, .. }) => {
-            format!("{entry_details}\n{}", format_metadata(metadata))
+            format!(
+                "{entry_details}\n{}",
+                format_metadata(metadata, app.language)
+            )
         }
         Some(PreviewArtifact::Image { .. }) => entry_details.clone(),
         _ => String::new(),
@@ -1107,24 +1235,35 @@ fn render_preview(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let text = match &app.preview {
         Some(PreviewArtifact::Text { text, truncated }) => {
             if *truncated {
-                format!("{text}\n\n[预览已截断到 2 MiB]")
+                format!(
+                    "{text}\n\n{}",
+                    app.language
+                        .text("[Preview truncated to 2 MiB]", "[预览已截断到 2 MiB]",)
+                )
             } else {
                 text.clone()
             }
         }
         Some(PreviewArtifact::MetadataOnly { reason, metadata }) => {
-            let metadata = metadata.as_ref().map(format_metadata).unwrap_or_default();
+            let metadata = metadata
+                .as_ref()
+                .map(|metadata| format_metadata(metadata, app.language))
+                .unwrap_or_default();
             [reason.as_str(), entry_details.as_str(), metadata.as_str()]
                 .into_iter()
                 .filter(|part| !part.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n")
         }
-        Some(PreviewArtifact::VideoFrame { metadata, .. }) => format_metadata(metadata),
-        Some(PreviewArtifact::Image { .. }) => "图片预览".to_owned(),
+        Some(PreviewArtifact::VideoFrame { metadata, .. }) => {
+            format_metadata(metadata, app.language)
+        }
+        Some(PreviewArtifact::Image { .. }) => {
+            app.language.text("Image preview", "图片预览").to_owned()
+        }
         None => app
             .selected_file()
-            .map(|entry| format_entry_details(entry, app.selected_snapshot()))
+            .map(|entry| format_entry_details(entry, app.selected_snapshot(), app.language))
             .unwrap_or_default(),
     };
     if matches!(&app.preview, Some(PreviewArtifact::Text { .. })) && !entry_details.is_empty() {
@@ -1367,7 +1506,11 @@ fn format_size(size: u64) -> String {
     }
 }
 
-fn format_entry_details(entry: &FileEntry, snapshot: Option<&Snapshot>) -> String {
+fn format_entry_details(
+    entry: &FileEntry,
+    snapshot: Option<&Snapshot>,
+    language: Language,
+) -> String {
     let snapshot = snapshot
         .map(|snapshot| {
             format!(
@@ -1378,29 +1521,29 @@ fn format_entry_details(entry: &FileEntry, snapshot: Option<&Snapshot>) -> Strin
         })
         .unwrap_or_else(|| "-".to_owned());
     format_detail_rows(&[
-        ("文件", entry.name.clone()),
-        ("快照", snapshot),
-        ("路径", entry.path.clone()),
+        (language.text("File", "文件"), entry.name.clone()),
+        (language.text("Snapshot", "快照"), snapshot),
+        (language.text("Path", "路径"), entry.path.clone()),
         (
-            "大小",
+            language.text("Size", "大小"),
             format!("{} ({} bytes)", format_size(entry.size), entry.size),
         ),
         (
-            "修改时间",
+            language.text("Modified", "修改时间"),
             entry.modified.as_deref().unwrap_or("-").to_owned(),
         ),
-        ("类型", format_entry_type(entry)),
+        (language.text("Type", "类型"), format_entry_type(entry)),
     ])
 }
 
-fn format_metadata(metadata: &crate::model::MediaMetadata) -> String {
+fn format_metadata(metadata: &crate::model::MediaMetadata, language: Language) -> String {
     format_detail_rows(&[
         (
-            "格式",
+            language.text("Format", "格式"),
             metadata.format_name.as_deref().unwrap_or("-").to_owned(),
         ),
         (
-            "尺寸",
+            language.text("Dimensions", "尺寸"),
             format!(
                 "{} × {}",
                 metadata
@@ -1412,17 +1555,18 @@ fn format_metadata(metadata: &crate::model::MediaMetadata) -> String {
             ),
         ),
         (
-            "时长",
-            metadata
-                .duration
-                .map_or_else(|| "-".to_owned(), |v| format!("{v:.2} 秒")),
+            language.text("Duration", "时长"),
+            metadata.duration.map_or_else(
+                || "-".to_owned(),
+                |v| format!("{v:.2} {}", language.text("seconds", "秒")),
+            ),
         ),
         (
-            "视频编码",
+            language.text("Video codec", "视频编码"),
             metadata.video_codec.as_deref().unwrap_or("-").to_owned(),
         ),
         (
-            "音频编码",
+            language.text("Audio codec", "音频编码"),
             metadata.audio_codec.as_deref().unwrap_or("-").to_owned(),
         ),
     ])
@@ -1461,6 +1605,7 @@ mod tests {
     };
     use crate::{
         cache::SessionCache,
+        language::Language,
         model::{FileEntry, FileType, Snapshot},
         preview::PreviewService,
         restic::ResticCliClient,
@@ -1487,7 +1632,7 @@ mod tests {
         }
     }
 
-    fn test_app(snapshots: Vec<Snapshot>) -> App {
+    fn test_app_with_language(snapshots: Vec<Snapshot>, language: Language) -> App {
         let repository = tempfile::tempdir().unwrap();
         let client = Arc::new(
             ResticCliClient::new(
@@ -1502,9 +1647,13 @@ mod tests {
             "ffprobe",
             SessionCache::new().unwrap(),
         ));
-        let mut app = App::new(client.clone(), client, preview, snapshots);
+        let mut app = App::new(client.clone(), client, preview, snapshots, language);
         app.replace_job();
         app
+    }
+
+    fn test_app(snapshots: Vec<Snapshot>) -> App {
+        test_app_with_language(snapshots, Language::English)
     }
 
     fn test_entry(name: &str, path: &str, file_type: FileType) -> FileEntry {
@@ -1621,8 +1770,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let rendered = rendered_text(terminal.backend());
-        assert!(rendered.contains("导 出 文 件 到 目 录"));
-        assert!(rendered.contains("不 覆 盖 同 名 文 件"));
+        assert!(rendered.contains("Export file into directory"));
+        assert!(rendered.contains("do not overwrite existing files"));
     }
 
     #[tokio::test]
@@ -1638,8 +1787,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let rendered = rendered_text(terminal.backend());
-        assert!(rendered.contains("恢 复 目 录 到 父 目 录"));
-        assert!(rendered.contains("不 合 并 同 名 目 录"));
+        assert!(rendered.contains("Restore directory into parent"));
+        assert!(rendered.contains("do not merge existing directories"));
     }
 
     #[tokio::test]
@@ -1651,7 +1800,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(matches!(app.input_mode, InputMode::Normal));
-        assert_eq!(app.status, "导出目录不能为空");
+        assert_eq!(app.status, "The export directory cannot be empty");
         assert!(app.active_job.is_none());
     }
 
@@ -1663,7 +1812,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
 
         assert!(matches!(app.input_mode, InputMode::Normal));
-        assert_eq!(app.status, "不能导出上级目录项");
+        assert_eq!(app.status, "The parent directory entry cannot be exported");
     }
 
     #[test]
@@ -1767,7 +1916,13 @@ mod tests {
             tags: Vec::new(),
             total_bytes: Some(0),
         };
-        let mut app = App::new(client.clone(), client, preview, vec![snapshot]);
+        let mut app = App::new(
+            client.clone(),
+            client,
+            preview,
+            vec![snapshot],
+            Language::English,
+        );
 
         for (width, height, wide) in [(80, 24, false), (120, 40, true), (92, 28, false)] {
             let backend = TestBackend::new(width, height);
@@ -1776,10 +1931,10 @@ mod tests {
             assert_eq!(terminal.backend().size().unwrap().width, width);
             assert_eq!(app.wide_layout, wide);
             let rendered = rendered_text(terminal.backend());
-            assert!(rendered.contains("文 件 ："));
-            assert!(rendered.contains("预 览"));
+            assert!(rendered.contains("Files:"));
+            assert!(rendered.contains("Preview"));
             assert!(rendered.contains("[`]"));
-            assert_eq!(rendered.contains("目 录 树"), wide);
+            assert_eq!(rendered.contains("Directory tree"), wide);
             if wide {
                 assert!(rendered.contains("[Tab]"));
                 app.focus = Focus::Directories;
@@ -1791,8 +1946,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chinese_language_renders_chinese_labels() {
+        let mut app = test_app_with_language(vec![test_snapshot('a')], Language::Chinese);
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let rendered = rendered_text(terminal.backend());
+        assert!(rendered.contains("快 照"));
+        assert!(rendered.contains("目 录 树"));
+        assert!(rendered.contains("文 件 ："));
+        assert!(rendered.contains("预 览"));
+    }
+
+    #[tokio::test]
     async fn only_focused_panel_has_a_black_text_selection_box_without_arrows() {
-        let mut app = test_app(vec![test_snapshot('a'), test_snapshot('b')]);
+        let mut app = test_app(vec![test_snapshot('x'), test_snapshot('b')]);
         app.set_wide_layout(true);
         app.focus = Focus::Snapshots;
         app.snapshot_index = 1;
@@ -1810,7 +1980,7 @@ mod tests {
         assert!(!has_symbol(terminal.backend(), snapshot_area, ">"));
 
         let active_snapshot = buffer
-            .cell(find_symbol(terminal.backend(), snapshot_area, "a"))
+            .cell(find_symbol(terminal.backend(), snapshot_area, "x"))
             .unwrap();
         assert_eq!(active_snapshot.fg, Color::White);
         assert_eq!(active_snapshot.bg, Color::Reset);
@@ -1964,7 +2134,13 @@ mod tests {
             tags: Vec::new(),
             total_bytes: Some(0),
         };
-        let mut app = App::new(client.clone(), client, preview, vec![snapshot]);
+        let mut app = App::new(
+            client.clone(),
+            client,
+            preview,
+            vec![snapshot],
+            Language::English,
+        );
         app.replace_job();
         app.focus = Focus::Files;
 

@@ -3,6 +3,7 @@ pub mod cache;
 pub mod error;
 pub mod export;
 pub mod jobs;
+pub mod language;
 pub mod model;
 pub mod preview;
 mod process;
