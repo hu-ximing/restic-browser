@@ -58,7 +58,6 @@ async fn run() -> Result<()> {
     }
     let cache = SessionCache::new()?;
     let preview_service = PreviewService::new(cli.ffmpeg, cli.ffprobe, cache);
-    preview_service.check_dependencies().await?;
 
     rtoolbox::print_tty::print_tty("仓库密码: ").map_err(AppError::Io)?;
     let password = rpassword::read_password().map_err(AppError::Io)?;

@@ -22,6 +22,12 @@ pub enum AppError {
     InvalidResponse(String),
     #[error("external command failed: {program}: {message}")]
     CommandFailed { program: String, message: String },
+    #[error("external command output exceeded {limit} bytes: {program} {stream}")]
+    ExternalOutputTooLarge {
+        program: String,
+        stream: &'static str,
+        limit: usize,
+    },
     #[error("invalid path: {0}")]
     InvalidPath(String),
     #[error(transparent)]

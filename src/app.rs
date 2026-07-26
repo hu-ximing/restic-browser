@@ -666,7 +666,13 @@ impl App {
                 return;
             }
         };
-        let destination = export_destination(&directory, &entry.name);
+        let destination = match export_destination(&directory, &entry.name) {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.show_error(error);
+                return;
+            }
+        };
         self.replace_job();
         if entry.is_dir() {
             self.status = format!("正在恢复 {}…", entry.name);
@@ -1191,8 +1197,23 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     .split(vertical[1])[1]
 }
 
-fn export_destination(directory: &Path, file_name: &str) -> PathBuf {
-    directory.join(file_name)
+fn export_destination(directory: &Path, file_name: &str) -> std::result::Result<PathBuf, AppError> {
+    let path = Path::new(file_name);
+    let mut components = path.components();
+    let is_single_name = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !is_single_name
+        || file_name
+            .chars()
+            .any(|character| matches!(character, '/' | '\\'))
+    {
+        return Err(AppError::InvalidPath(format!(
+            "snapshot entry is not a portable file name: {file_name:?}"
+        )));
+    }
+    Ok(directory.join(file_name))
 }
 
 fn is_parent_entry(entry: &FileEntry) -> bool {
@@ -1555,9 +1576,32 @@ mod tests {
         let file_name = "中文 空格 😀.txt";
 
         assert_eq!(
-            export_destination(&directory, file_name),
+            export_destination(&directory, file_name).unwrap(),
             directory.join(file_name)
         );
+    }
+
+    #[test]
+    fn export_destination_rejects_path_components_and_both_separators() {
+        let directory = std::path::Path::new("exports");
+
+        for file_name in [
+            "",
+            ".",
+            "..",
+            "../evil.txt",
+            r"..\evil.txt",
+            "sub/file.txt",
+            r"sub\file.txt",
+        ] {
+            assert!(
+                matches!(
+                    export_destination(directory, file_name),
+                    Err(crate::AppError::InvalidPath(_))
+                ),
+                "{file_name:?} should not be accepted as a file name"
+            );
+        }
     }
 
     #[tokio::test]

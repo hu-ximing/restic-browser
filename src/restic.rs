@@ -7,17 +7,20 @@ use std::{
 
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
-use tokio::{
-    io::AsyncReadExt,
-    process::{Child, Command},
-};
+use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     AppError, Result,
     model::{FileEntry, FileType, SearchResult, Snapshot},
+    process::read_limited,
     repository::RepositoryReader,
 };
+
+const MAX_CAPTURE_STDOUT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_CAPTURE_STDERR_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 100_000;
+const MAX_SEARCH_RESULTS: usize = 100_000;
 
 #[derive(Debug, Clone)]
 pub struct ResticCliClient {
@@ -130,6 +133,11 @@ impl ResticCliClient {
             .into_iter()
             .filter_map(|value| parse_file_entry(&value).transpose())
             .collect::<Result<Vec<_>>>()?;
+        if entries.len() > MAX_DIRECTORY_ENTRIES {
+            return Err(AppError::InvalidResponse(format!(
+                "directory contains more than {MAX_DIRECTORY_ENTRIES} entries"
+            )));
+        }
 
         entries.retain(|entry| {
             entry.path != path
@@ -188,7 +196,12 @@ impl ResticCliClient {
             .spawn()
             .map_err(|error| dependency_error(&self.executable, error))?;
         let stderr = child.stderr.take().expect("stderr was piped");
-        let stderr_task = tokio::spawn(read_all(stderr));
+        let stderr_task = tokio::spawn(read_limited(
+            stderr,
+            MAX_CAPTURE_STDERR_BYTES,
+            "restic".to_owned(),
+            "stderr",
+        ));
         let status = wait_or_cancel(&mut child, token).await?;
         let stderr = stderr_task
             .await
@@ -281,8 +294,18 @@ impl ResticCliClient {
             .map_err(|error| dependency_error(&self.executable, error))?;
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
-        let stdout_task = tokio::spawn(read_all(stdout));
-        let stderr_task = tokio::spawn(read_all(stderr));
+        let stdout_task = tokio::spawn(read_limited(
+            stdout,
+            MAX_CAPTURE_STDOUT_BYTES,
+            "restic".to_owned(),
+            "stdout",
+        ));
+        let stderr_task = tokio::spawn(read_limited(
+            stderr,
+            MAX_CAPTURE_STDERR_BYTES,
+            "restic".to_owned(),
+            "stderr",
+        ));
         let status = wait_or_cancel(&mut child, token).await?;
         let stdout = stdout_task
             .await
@@ -361,12 +384,6 @@ impl RepositoryReader for ResticCliClient {
             ResticCliClient::dump_to_path(self, &snapshot, &source, &destination, token).await
         })
     }
-}
-
-async fn read_all(mut reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
-    Ok(bytes)
 }
 
 async fn wait_or_cancel(
@@ -531,6 +548,11 @@ fn collect_find_results(
             if let Some(matches) = map.get("matches") {
                 collect_find_results(snapshot_id, snapshot_time, matches, output)?;
             } else if let Some(entry) = parse_file_entry(value)? {
+                if output.len() == MAX_SEARCH_RESULTS {
+                    return Err(AppError::InvalidResponse(format!(
+                        "search returned more than {MAX_SEARCH_RESULTS} results"
+                    )));
+                }
                 output.push(SearchResult {
                     snapshot_id: snapshot_id.to_owned(),
                     snapshot_time: snapshot_time.map(str::to_owned),

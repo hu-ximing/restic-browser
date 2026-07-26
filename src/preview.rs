@@ -15,10 +15,13 @@ use crate::{
     AppError, Result,
     cache::SessionCache,
     model::{FileEntry, MediaMetadata, PreviewArtifact},
+    process::read_limited,
     repository::RepositoryHandle,
 };
 
 const TEXT_LIMIT: usize = 2 * 1024 * 1024;
+const MAX_EXTERNAL_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_EXTERNAL_STDERR_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct PreviewService {
@@ -204,16 +207,20 @@ async fn run_external(
                 AppError::Io(error)
             }
         })?;
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let mut stderr = child.stderr.take().expect("stderr was piped");
-    let stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
-    });
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let stdout_task = tokio::spawn(read_limited(
+        stdout,
+        MAX_EXTERNAL_STDOUT_BYTES,
+        program.display().to_string(),
+        "stdout",
+    ));
+    let stderr_task = tokio::spawn(read_limited(
+        stderr,
+        MAX_EXTERNAL_STDERR_BYTES,
+        program.display().to_string(),
+        "stderr",
+    ));
     let status = tokio::select! {
         status = child.wait() => status?,
         _ = token.cancelled() => {

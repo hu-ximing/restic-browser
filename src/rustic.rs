@@ -30,6 +30,8 @@ use crate::{
 };
 
 type BlockingTask = Box<dyn FnOnce() + Send + 'static>;
+const MAX_DIRECTORY_ENTRIES: usize = 100_000;
+const MAX_SEARCH_RESULTS: usize = 100_000;
 
 #[derive(Clone)]
 struct BlockingExecutor {
@@ -308,15 +310,17 @@ fn list_directory<S: IndexedTree>(
         .node_from_snapshot_and_path(&snapshot, &path)
         .map_err(map_rustic_error)?;
     let options = LsOptions::default().recursive(false);
-    let mut entries = repository
-        .ls(&node, &options)
-        .map_err(map_rustic_error)?
-        .map(|item| {
-            ensure_not_cancelled(token)?;
-            let (relative, node) = item.map_err(map_rustic_error)?;
-            node_to_entry(&path, &relative, &node)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut entries = Vec::new();
+    for item in repository.ls(&node, &options).map_err(map_rustic_error)? {
+        ensure_not_cancelled(token)?;
+        if entries.len() == MAX_DIRECTORY_ENTRIES {
+            return Err(AppError::InvalidResponse(format!(
+                "directory contains more than {MAX_DIRECTORY_ENTRIES} entries"
+            )));
+        }
+        let (relative, node) = item.map_err(map_rustic_error)?;
+        entries.push(node_to_entry(&path, &relative, &node)?);
+    }
     sort_entries(&mut entries);
     Ok(entries)
 }
@@ -357,6 +361,11 @@ fn find<S: IndexedTree>(
             .file_name()
             .is_some_and(|name| matcher.is_match(Path::new(name)));
         if matcher.is_match(&portable) || matcher.is_match(format!("/{portable}")) || name_matches {
+            if results.len() == MAX_SEARCH_RESULTS {
+                return Err(AppError::InvalidResponse(format!(
+                    "search returned more than {MAX_SEARCH_RESULTS} results"
+                )));
+            }
             results.push(SearchResult {
                 snapshot_id: snapshot_id.to_owned(),
                 snapshot_time: Some(snapshot.time.to_string()),

@@ -5,6 +5,7 @@ pub mod export;
 pub mod jobs;
 pub mod model;
 pub mod preview;
+mod process;
 pub mod repository;
 pub mod restic;
 pub mod rustic;
