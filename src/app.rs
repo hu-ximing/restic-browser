@@ -219,7 +219,7 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Enter => self.activate_selection(),
-            KeyCode::Backspace => self.go_parent(),
+            KeyCode::Backspace | KeyCode::Left => self.go_parent(),
             KeyCode::Char('/') => self.input_mode = InputMode::Search(String::new()),
             KeyCode::Char('p') => self.start_preview(),
             KeyCode::Char('e') => {
@@ -228,8 +228,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.load_directory(self.current_path.clone()),
-            KeyCode::Left => self.seek_video(-5),
-            KeyCode::Right => self.seek_video(5),
+            KeyCode::Right => self.enter_selection(),
             _ => {}
         }
     }
@@ -266,8 +265,18 @@ impl App {
         }
     }
 
+    fn enter_selection(&mut self) {
+        if self.focus == Focus::Snapshots || self.selected_file().is_some_and(FileEntry::is_dir) {
+            self.activate_selection();
+        }
+    }
+
     fn go_parent(&mut self) {
-        if self.focus != Focus::Files || self.current_path == "/" {
+        if self.focus != Focus::Files {
+            return;
+        }
+        if self.current_path == "/" {
+            self.focus = Focus::Snapshots;
             return;
         }
         let trimmed = self.current_path.trim_end_matches('/');
@@ -367,19 +376,6 @@ impl App {
         )));
     }
 
-    fn seek_video(&mut self, seconds: i64) {
-        if !matches!(self.preview, Some(PreviewArtifact::VideoFrame { .. })) {
-            return;
-        }
-        self.video_position = if seconds < 0 {
-            self.video_position
-                .saturating_sub(Duration::from_secs(seconds.unsigned_abs()))
-        } else {
-            self.video_position + Duration::from_secs(seconds as u64)
-        };
-        self.start_preview();
-    }
-
     fn replace_job(&mut self) {
         if let Some(job) = self.active_job.take() {
             job.cancel();
@@ -434,7 +430,7 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
     render_preview(frame, app, sections[2]);
     frame.render_widget(
         Paragraph::new(
-            " Tab 切换  Enter 打开  Backspace 返回  / 搜索  p 预览  e 导出  r 刷新  q 退出",
+            " Tab 切换  Enter 打开  ← 返回  → 进入  / 搜索  p 预览  e 导出  r 刷新  q 退出",
         )
         .style(Style::default().fg(Color::DarkGray)),
         sections[3],
@@ -627,10 +623,14 @@ fn format_metadata(metadata: &crate::model::MediaMetadata) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use super::{App, centered_rect, format_size};
+    use super::{App, Focus, centered_rect, format_size};
     use crate::{
-        cache::SessionCache, model::Snapshot, preview::PreviewService, restic::ResticCliClient,
+        cache::SessionCache,
+        model::{FileEntry, FileType, Snapshot},
+        preview::PreviewService,
+        restic::ResticCliClient,
     };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{
         Terminal,
         backend::{Backend, TestBackend},
@@ -687,5 +687,76 @@ mod tests {
             assert_eq!(terminal.backend().size().unwrap().width, width);
         }
         app.cancel_active_job();
+    }
+
+    #[tokio::test]
+    async fn horizontal_arrows_navigate_directories_but_do_not_preview_files() {
+        let repository = tempfile::tempdir().unwrap();
+        let client = Arc::new(
+            ResticCliClient::new(
+                "restic",
+                repository.path(),
+                SecretString::from("test".to_owned()),
+            )
+            .unwrap(),
+        );
+        let preview = Arc::new(PreviewService::new(
+            "ffmpeg",
+            "ffprobe",
+            SessionCache::new().unwrap(),
+        ));
+        let snapshot = Snapshot {
+            id: "a".repeat(64),
+            short_id: "aaaaaaaa".to_owned(),
+            time: "2026-01-01T00:00:00Z".to_owned(),
+            hostname: "test-host".to_owned(),
+            username: None,
+            paths: vec!["/".to_owned()],
+            tags: Vec::new(),
+            total_bytes: Some(0),
+        };
+        let mut app = App::new(client, preview, vec![snapshot]);
+        app.replace_job();
+        app.focus = Focus::Files;
+
+        app.current_path = "/parent/child".to_owned();
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.current_path, "/parent");
+        app.replace_job();
+
+        app.entries = vec![FileEntry {
+            name: "directory".to_owned(),
+            path: "/parent/directory".to_owned(),
+            file_type: FileType::Directory,
+            size: 0,
+            modified: None,
+            mode: None,
+            uid: None,
+            gid: None,
+            link_target: None,
+        }];
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.current_path, "/parent/directory");
+        app.replace_job();
+
+        app.entries = vec![FileEntry {
+            name: "file.txt".to_owned(),
+            path: "/parent/directory/file.txt".to_owned(),
+            file_type: FileType::File,
+            size: 1,
+            modified: None,
+            mode: None,
+            uid: None,
+            gid: None,
+            link_target: None,
+        }];
+        app.status = "unchanged".to_owned();
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.status, "unchanged");
+        assert!(app.active_job.is_none());
+
+        app.current_path = "/".to_owned();
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.focus == Focus::Snapshots);
     }
 }
