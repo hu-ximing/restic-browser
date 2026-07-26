@@ -71,8 +71,7 @@ struct TreeRow {
     path: String,
     name: String,
     depth: usize,
-    expanded: bool,
-    has_children: bool,
+    prefix: String,
 }
 
 impl ActiveJob {
@@ -115,7 +114,6 @@ pub struct App {
     tree_offset: usize,
     tree_page_len: usize,
     focus: Focus,
-    last_browser_focus: Focus,
     wide_layout: bool,
     input_mode: InputMode,
     status: String,
@@ -159,7 +157,6 @@ impl App {
             tree_offset: 0,
             tree_page_len: 0,
             focus: Focus::Snapshots,
-            last_browser_focus: Focus::Files,
             wide_layout: false,
             input_mode: InputMode::Normal,
             status: "就绪".to_owned(),
@@ -268,8 +265,9 @@ impl App {
                 self.should_quit = true;
             }
             KeyCode::Esc => self.cancel_active_job(),
-            KeyCode::Char('`') => self.toggle_snapshots_focus(),
-            KeyCode::Tab => self.toggle_browser_focus(),
+            KeyCode::Char('`') => self.focus = Focus::Snapshots,
+            KeyCode::Tab if self.wide_layout => self.focus = Focus::Directories,
+            KeyCode::Char(' ') => self.focus = Focus::Files,
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.page_selection(false),
@@ -293,41 +291,12 @@ impl App {
                 false,
             ),
             KeyCode::Right => match self.focus {
-                Focus::Snapshots => self.activate_snapshot(),
+                Focus::Snapshots => self.open_snapshot_files(),
                 Focus::Directories => self.expand_tree_selection(),
                 Focus::Files => self.enter_file_selection(),
             },
             _ => {}
         }
-    }
-
-    fn toggle_snapshots_focus(&mut self) {
-        if self.focus == Focus::Snapshots {
-            self.restore_browser_focus();
-        } else {
-            self.last_browser_focus = self.focus;
-            self.focus = Focus::Snapshots;
-        }
-    }
-
-    fn toggle_browser_focus(&mut self) {
-        if self.focus == Focus::Snapshots || !self.wide_layout {
-            return;
-        }
-        self.focus = match self.focus {
-            Focus::Directories => Focus::Files,
-            Focus::Files => Focus::Directories,
-            Focus::Snapshots => unreachable!(),
-        };
-        self.last_browser_focus = self.focus;
-    }
-
-    fn restore_browser_focus(&mut self) {
-        self.focus = if self.wide_layout && self.last_browser_focus == Focus::Directories {
-            Focus::Directories
-        } else {
-            Focus::Files
-        };
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -423,7 +392,15 @@ impl App {
             self.clear_preview();
             self.start_directory_load("/".to_owned(), DirectoryLoadPurpose::Browse, false);
         }
-        self.restore_browser_focus();
+    }
+
+    fn open_snapshot_files(&mut self) {
+        if self.snapshots.is_empty() {
+            self.activate_snapshot();
+            return;
+        }
+        self.activate_snapshot();
+        self.focus = Focus::Files;
     }
 
     fn enter_file_selection(&mut self) {
@@ -531,6 +508,9 @@ impl App {
                 self.entry_index = 0;
                 self.entry_offset = 0;
                 self.status = format!("已加载 {count} 个项目");
+                if self.focus == Focus::Directories {
+                    self.adjust_tree_view_for_children(&load.path);
+                }
             }
             DirectoryLoadPurpose::Expand => {
                 self.expanded_directories.insert(load.path);
@@ -544,6 +524,38 @@ impl App {
         while let Some(current) = cursor {
             self.expanded_directories.insert(current.clone());
             cursor = parent_repository_path(&current);
+        }
+    }
+
+    fn adjust_tree_view_for_children(&mut self, path: &str) {
+        if self.tree_page_len == 0 {
+            return;
+        }
+        let rows = self.tree_rows();
+        let Some(selected) = rows.iter().position(|row| row.path == path) else {
+            return;
+        };
+        let selected_depth = rows[selected].depth;
+        let last_child = rows
+            .iter()
+            .enumerate()
+            .skip(selected + 1)
+            .take_while(|(_, row)| row.depth > selected_depth)
+            .filter(|(_, row)| row.depth == selected_depth + 1)
+            .map(|(index, _)| index)
+            .last();
+        let Some(last_child) = last_child else {
+            return;
+        };
+        let visible_bottom = self
+            .tree_offset
+            .saturating_add(self.tree_page_len.saturating_sub(1));
+        if last_child > visible_bottom {
+            let required_offset = last_child + 1 - self.tree_page_len;
+            self.tree_offset = self
+                .tree_offset
+                .max(required_offset.min(selected))
+                .min(selected);
         }
     }
 
@@ -663,22 +675,26 @@ impl App {
 
     fn tree_rows(&self) -> Vec<TreeRow> {
         let mut rows = Vec::new();
-        self.collect_tree_rows("/", "/", 0, &mut rows);
+        self.collect_tree_rows("/", "/", 0, String::new(), String::new(), &mut rows);
         rows
     }
 
-    fn collect_tree_rows(&self, path: &str, name: &str, depth: usize, rows: &mut Vec<TreeRow>) {
+    fn collect_tree_rows(
+        &self,
+        path: &str,
+        name: &str,
+        depth: usize,
+        prefix: String,
+        child_prefix: String,
+        rows: &mut Vec<TreeRow>,
+    ) {
         let children = self.directory_cache.get(path);
-        let has_children = children
-            .map(|entries| entries.iter().any(FileEntry::is_dir))
-            .unwrap_or(true);
         let expanded = self.expanded_directories.contains(path);
         rows.push(TreeRow {
             path: path.to_owned(),
             name: name.to_owned(),
             depth,
-            expanded,
-            has_children,
+            prefix,
         });
         if !expanded {
             return;
@@ -686,8 +702,23 @@ impl App {
         let Some(children) = children else {
             return;
         };
-        for child in children.iter().filter(|entry| entry.is_dir()) {
-            self.collect_tree_rows(&child.path, &child.name, depth + 1, rows);
+        let directories = children
+            .iter()
+            .filter(|entry| entry.is_dir())
+            .collect::<Vec<_>>();
+        for (index, child) in directories.iter().enumerate() {
+            let is_last = index + 1 == directories.len();
+            let prefix = format!("{child_prefix}{}", if is_last { "└── " } else { "├── " });
+            let descendant_prefix =
+                format!("{child_prefix}{}", if is_last { "    " } else { "│   " });
+            self.collect_tree_rows(
+                &child.path,
+                &child.name,
+                depth + 1,
+                prefix,
+                descendant_prefix,
+                rows,
+            );
         }
     }
 
@@ -733,9 +764,9 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
         render_preview(frame, app, content[1]);
     }
     let shortcuts = if wide_layout {
-        " Tab 目录树/文件  ` 快照  PgUp/PgDn 翻页  Enter 打开  ←/→ 导航  / 搜索  p 预览  e 导出  r 刷新  q 退出"
+        " ` 快照  Tab 目录树  Space 文件  PgUp/PgDn 翻页  Enter 打开  ←/→ 导航  / 搜索  p 预览  e 导出  r 刷新  q 退出"
     } else {
-        " ` 快照  PgUp/PgDn 翻页  Enter 打开  ←/→ 导航  / 搜索  p 预览  e 导出  r 刷新  q 退出"
+        " ` 快照  Space 文件  PgUp/PgDn 翻页  Enter 打开  ←/→ 导航  / 搜索  p 预览  e 导出  r 刷新  q 退出"
     };
     frame.render_widget(
         Paragraph::new(shortcuts)
@@ -754,11 +785,9 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
 fn render_snapshots(frame: &mut Frame<'_>, app: &mut App, area: Rect, condensed: bool) {
     let items = app.snapshots.iter().enumerate().map(|(index, snapshot)| {
         let active_style = if index == app.active_snapshot_index {
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::White)
         } else {
-            Style::default()
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
         };
         if condensed {
             let size = snapshot
@@ -775,16 +804,11 @@ fn render_snapshots(frame: &mut Frame<'_>, app: &mut App, area: Rect, condensed:
                 active_style,
             ))
         } else {
-            let secondary_style = if index == app.active_snapshot_index {
-                active_style
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
             ListItem::new(vec![
                 Line::styled(snapshot.time.clone(), active_style),
                 Line::styled(
                     format!("{}  {}", snapshot.short_id, snapshot.hostname),
-                    secondary_style,
+                    active_style,
                 ),
             ])
         }
@@ -801,12 +825,8 @@ fn render_snapshots(frame: &mut Frame<'_>, app: &mut App, area: Rect, condensed:
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border)),
         )
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("› ");
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::DarkGray))
+        .highlight_symbol("");
     app.snapshot_page_len = usize::from(
         area.height
             .saturating_sub(2)
@@ -814,7 +834,10 @@ fn render_snapshots(frame: &mut Frame<'_>, app: &mut App, area: Rect, condensed:
             .unwrap_or(0),
     );
     let mut state = ListState::default()
-        .with_selected((!app.snapshots.is_empty()).then_some(app.snapshot_index))
+        .with_selected(
+            (app.focus == Focus::Snapshots && !app.snapshots.is_empty())
+                .then_some(app.snapshot_index),
+        )
         .with_offset(app.snapshot_offset);
     frame.render_stateful_widget(list, area, &mut state);
     app.snapshot_offset = state.offset();
@@ -823,26 +846,16 @@ fn render_snapshots(frame: &mut Frame<'_>, app: &mut App, area: Rect, condensed:
 fn render_directory_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let rows = app.tree_rows();
     let items = rows.iter().map(|row| {
-        let marker = if row.expanded {
-            "▾"
-        } else if row.has_children {
-            "▸"
-        } else {
-            " "
-        };
         let style = if row.path == app.current_path {
             Style::default()
-                .fg(Color::Green)
+                .fg(Color::Blue)
                 .add_modifier(Modifier::BOLD)
         } else if is_repository_ancestor(&row.path, &app.current_path) {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(Color::Blue)
         } else {
             Style::default()
         };
-        ListItem::new(Line::styled(
-            format!("{}{} {}", "  ".repeat(row.depth), marker, row.name),
-            style,
-        ))
+        ListItem::new(Line::styled(format!("{}{}", row.prefix, row.name), style))
     });
     let border = if app.focus == Focus::Directories {
         Color::Cyan
@@ -858,14 +871,20 @@ fn render_directory_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         )
         .highlight_style(
             Style::default()
+                .fg(Color::Black)
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("› ");
+        .highlight_symbol("");
     let selected = rows
         .iter()
         .position(|row| row.path == app.tree_path)
         .or((!rows.is_empty()).then_some(0));
+    let selected = if app.focus == Focus::Directories {
+        selected
+    } else {
+        None
+    };
     app.tree_page_len = usize::from(area.height.saturating_sub(2));
     let mut state = ListState::default()
         .with_selected(selected)
@@ -913,11 +932,13 @@ fn render_files(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border)),
     )
-    .row_highlight_style(Style::default().bg(Color::DarkGray))
-    .highlight_symbol("› ");
+    .row_highlight_style(Style::default().fg(Color::Black).bg(Color::DarkGray))
+    .highlight_symbol("");
     app.entry_page_len = usize::from(area.height.saturating_sub(3));
     let mut state = TableState::default()
-        .with_selected((!app.entries.is_empty()).then_some(app.entry_index))
+        .with_selected(
+            (app.focus == Focus::Files && !app.entries.is_empty()).then_some(app.entry_index),
+        )
         .with_offset(app.entry_offset);
     frame.render_stateful_widget(table, area, &mut state);
     app.entry_offset = state.offset();
@@ -1286,7 +1307,7 @@ mod tests {
         Terminal,
         backend::{Backend, TestBackend},
         layout::Rect,
-        style::Color,
+        style::{Color, Modifier},
     };
     use secrecy::SecretString;
 
@@ -1344,6 +1365,32 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn find_symbol(backend: &TestBackend, area: Rect, symbol: &str) -> (u16, u16) {
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if backend
+                    .buffer()
+                    .cell((x, y))
+                    .is_some_and(|cell| cell.symbol() == symbol)
+                {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("symbol {symbol:?} not found in {area:?}");
+    }
+
+    fn has_symbol(backend: &TestBackend, area: Rect, symbol: &str) -> bool {
+        (area.top()..area.bottom()).any(|y| {
+            (area.left()..area.right()).any(|x| {
+                backend
+                    .buffer()
+                    .cell((x, y))
+                    .is_some_and(|cell| cell.symbol() == symbol)
+            })
+        })
     }
 
     #[test]
@@ -1460,6 +1507,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_focused_panel_has_a_black_text_selection_box_without_arrows() {
+        let mut app = test_app(vec![test_snapshot('a'), test_snapshot('b')]);
+        app.set_wide_layout(true);
+        app.focus = Focus::Snapshots;
+        app.snapshot_index = 1;
+        app.active_snapshot_index = 0;
+        app.entries = vec![test_entry("Zfile.txt", "/Zfile.txt", FileType::File)];
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let snapshot_area = Rect::new(0, 1, 29, 15);
+        let tree_area = Rect::new(0, 16, 29, 21);
+        let file_area = Rect::new(29, 1, 45, 36);
+
+        assert!(!has_symbol(terminal.backend(), snapshot_area, ">"));
+
+        let active_snapshot = buffer
+            .cell(find_symbol(terminal.backend(), snapshot_area, "a"))
+            .unwrap();
+        assert_eq!(active_snapshot.fg, Color::White);
+        assert_eq!(active_snapshot.bg, Color::Reset);
+        assert!(!active_snapshot.modifier.contains(Modifier::BOLD));
+
+        let inactive_snapshot = buffer
+            .cell(find_symbol(terminal.backend(), snapshot_area, "b"))
+            .unwrap();
+        assert_eq!(inactive_snapshot.fg, Color::Black);
+        assert_eq!(inactive_snapshot.bg, Color::DarkGray);
+        assert!(inactive_snapshot.modifier.contains(Modifier::DIM));
+
+        let file = buffer
+            .cell(find_symbol(terminal.backend(), file_area, "Z"))
+            .unwrap();
+        assert_eq!(file.bg, Color::Reset);
+        assert!(!has_symbol(terminal.backend(), file_area, ">"));
+
+        let current_directory = buffer
+            .cell(find_symbol(terminal.backend(), tree_area, "/"))
+            .unwrap();
+        assert_eq!(current_directory.fg, Color::Blue);
+        assert_eq!(current_directory.bg, Color::Reset);
+        assert!(!has_symbol(terminal.backend(), tree_area, ">"));
+
+        app.focus = Focus::Directories;
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let selected_directory = terminal
+            .backend()
+            .buffer()
+            .cell(find_symbol(terminal.backend(), tree_area, "/"))
+            .unwrap();
+        assert_eq!(selected_directory.fg, Color::Black);
+        assert_eq!(selected_directory.bg, Color::DarkGray);
+
+        app.focus = Focus::Files;
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let selected_file = terminal
+            .backend()
+            .buffer()
+            .cell(find_symbol(terminal.backend(), file_area, "Z"))
+            .unwrap();
+        assert_eq!(selected_file.fg, Color::Black);
+        assert_eq!(selected_file.bg, Color::DarkGray);
+    }
+
+    #[tokio::test]
     async fn horizontal_arrows_navigate_directories_but_do_not_preview_files() {
         let repository = tempfile::tempdir().unwrap();
         let client = Arc::new(
@@ -1531,7 +1645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tab_only_switches_tree_and_files_and_backtick_restores_browser_state() {
+    async fn focus_keys_switch_to_one_specific_panel_and_preserve_browser_state() {
         let mut app = test_app(vec![test_snapshot('a')]);
         app.set_wide_layout(true);
         app.focus = Focus::Files;
@@ -1565,20 +1679,28 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Directories);
-        app.handle_key(KeyEvent::new(KeyCode::Char('`'), KeyModifiers::NONE));
-        assert_eq!(app.focus, Focus::Snapshots);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Directories);
+        app.handle_key(KeyEvent::new(KeyCode::Char('`'), KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Snapshots);
         app.handle_key(KeyEvent::new(KeyCode::Char('`'), KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Snapshots);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Files);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
 
-        assert_eq!(app.focus, Focus::Directories);
+        assert_eq!(app.focus, Focus::Files);
         assert_eq!(app.current_path, "/home/minato/Pictures");
         assert_eq!(app.tree_path, "/home/minato");
         assert_eq!(app.entry_index, 1);
+
+        app.set_wide_layout(false);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Files);
     }
 
     #[tokio::test]
-    async fn moving_snapshot_cursor_does_not_switch_the_browsed_snapshot_until_enter() {
+    async fn horizontal_arrows_do_not_move_snapshot_cursor_and_right_opens_its_files() {
         let mut app = test_app(vec![test_snapshot('a'), test_snapshot('b')]);
         app.set_wide_layout(true);
         app.focus = Focus::Files;
@@ -1587,7 +1709,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('`'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('`'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
 
         assert_eq!(app.active_snapshot_index, 0);
         assert_eq!(app.selected_snapshot().unwrap().short_id, "aaaaaaaa");
@@ -1595,7 +1717,10 @@ mod tests {
         assert_eq!(app.entry_index, 3);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('`'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let snapshot_index = app.snapshot_index;
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.snapshot_index, snapshot_index);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
 
         assert_eq!(app.active_snapshot_index, 1);
         assert_eq!(app.selected_snapshot().unwrap().short_id, "bbbbbbbb");
@@ -1648,12 +1773,85 @@ mod tests {
                 .iter()
                 .any(|row| row.path == "/photos/trips")
         );
+        let rows = app.tree_rows();
+        assert_eq!(rows[0].prefix, "");
+        assert_eq!(rows[1].prefix, "└── ");
+        assert_eq!(rows[2].prefix, "    └── ");
 
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert!(!app.expanded_directories.contains("/photos"));
         assert_eq!(app.tree_path, "/photos");
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert_eq!(app.tree_path, "/");
+    }
+
+    #[tokio::test]
+    async fn tree_enter_reveals_children_until_the_selection_reaches_the_top() {
+        let mut app = test_app(vec![test_snapshot('a')]);
+        app.set_wide_layout(true);
+        app.finish_directory_load(super::DirectoryLoad {
+            path: "/".to_owned(),
+            entries: (0..7)
+                .map(|index| {
+                    test_entry(
+                        &format!("d{index}"),
+                        &format!("/d{index}"),
+                        FileType::Directory,
+                    )
+                })
+                .collect(),
+            purpose: super::DirectoryLoadPurpose::Browse,
+        });
+        app.directory_cache.insert(
+            "/d5".to_owned(),
+            (0..10)
+                .map(|index| {
+                    test_entry(
+                        &format!("child{index}"),
+                        &format!("/d5/child{index}"),
+                        FileType::Directory,
+                    )
+                })
+                .collect(),
+        );
+        app.focus = Focus::Directories;
+        app.tree_path = "/d5".to_owned();
+        app.tree_page_len = 8;
+        let rows = app.tree_rows();
+        assert_eq!(rows[1].prefix, "├── ");
+        assert_eq!(rows[7].prefix, "└── ");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let selected = app
+            .tree_rows()
+            .iter()
+            .position(|row| row.path == "/d5")
+            .unwrap();
+        assert_eq!(app.tree_offset, selected);
+
+        app.tree_offset = 0;
+        app.directory_cache.insert(
+            "/d5".to_owned(),
+            (0..3)
+                .map(|index| {
+                    test_entry(
+                        &format!("child{index}"),
+                        &format!("/d5/child{index}"),
+                        FileType::Directory,
+                    )
+                })
+                .collect(),
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let rows = app.tree_rows();
+        let last_child = rows
+            .iter()
+            .position(|row| row.path == "/d5/child2")
+            .unwrap();
+        assert_eq!(app.tree_offset, 2);
+        assert!(last_child < app.tree_offset + app.tree_page_len);
     }
 
     #[tokio::test]
