@@ -6,6 +6,8 @@
 视频帧，并安全导出文件或恢复目录。Windows x64 是当前发布优先级；代码和 CI 同时面向
 Windows、Linux 和 macOS。
 
+![程序截图](docs/images/screenshot.png)
+
 ## 当前实现
 
 - 默认后端是第三方 Rust 实现 `rustic_core`，打开仓库后复用同一个解锁会话。

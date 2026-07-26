@@ -6,6 +6,8 @@
 previewing text, images, and video frames, and safely exporting files or restoring directories.
 Windows x64 is the current release priority; the code and CI also target Linux and macOS.
 
+![application screenshot](docs/images/screenshot.png)
+
 ## Current implementation
 
 - The default backend is the third-party Rust implementation `rustic_core`, which reuses one
