@@ -28,8 +28,9 @@ async fn real_repository_browse_search_dump_and_export() {
     let source = fixture.path().join("中文 空格 😀.txt");
     let image_path = fixture.path().join("preview image.png");
     let video_path = fixture.path().join("preview video.mp4");
-    let folder = fixture.path().join("folder");
-    let nested_path = folder.join("nested.txt");
+    let folder = fixture.path().join("目录 空格 😀");
+    let nested_name = "嵌套 文件 😀.txt";
+    let nested_path = folder.join(nested_name);
     let expected = "restic-browser 集成测试\nsecond line\n".as_bytes();
     std::fs::write(&source, expected).expect("write fixture");
     std::fs::create_dir(&folder).expect("create nested fixture directory");
@@ -102,7 +103,7 @@ async fn real_repository_browse_search_dump_and_export() {
     assert_eq!(entry_keys(&root), entry_keys(&cli_root));
     let folder_entry = root
         .iter()
-        .find(|entry| entry.name == "folder")
+        .find(|entry| entry.name == "目录 空格 😀")
         .expect("folder in root listing");
     let nested = rustic_client
         .list_directory(
@@ -112,7 +113,7 @@ async fn real_repository_browse_search_dump_and_export() {
         )
         .await
         .expect("list nested directory");
-    assert!(nested.iter().any(|entry| entry.name == "nested.txt"));
+    assert!(nested.iter().any(|entry| entry.name == nested_name));
 
     let matches = rustic_client
         .find(&snapshots[0].id, "*.txt", CancellationToken::new())
@@ -150,6 +151,63 @@ async fn real_repository_browse_search_dump_and_export() {
         .await;
     assert!(matches!(existing, Err(AppError::DestinationExists(_))));
     assert_eq!(std::fs::read(existing_destination).unwrap(), expected);
+
+    let restore_parent = fixture.path().join("恢复目标 中文 😀");
+    std::fs::create_dir(&restore_parent).expect("create restore parent");
+    let restored_directory = restore_parent.join(&folder_entry.name);
+    let restored = cli_client
+        .restore_directory(
+            &snapshots[0].id,
+            &folder_entry.path,
+            &restored_directory,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("restore directory selected through rustic browser");
+    assert_eq!(restored, restored_directory);
+    assert_eq!(
+        std::fs::read(restored.join(nested_name)).unwrap(),
+        b"nested fixture"
+    );
+
+    let existing_restore = cli_client
+        .restore_directory(
+            &snapshots[0].id,
+            &folder_entry.path,
+            &restored,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        existing_restore,
+        Err(AppError::DestinationExists(_))
+    ));
+
+    let failed_restore = restore_parent.join("failed");
+    let failed = cli_client
+        .restore_directory(
+            &snapshots[0].id,
+            "/missing-directory",
+            &failed_restore,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(failed.is_err());
+    assert!(!failed_restore.exists());
+
+    let cancelled_restore = restore_parent.join("cancelled");
+    let cancelled_token = CancellationToken::new();
+    cancelled_token.cancel();
+    let cancelled = cli_client
+        .restore_directory(
+            &snapshots[0].id,
+            &folder_entry.path,
+            &cancelled_restore,
+            cancelled_token,
+        )
+        .await;
+    assert!(matches!(cancelled, Err(AppError::Cancelled)));
+    assert!(!cancelled_restore.exists());
 
     let preview_service = PreviewService::new(
         "ffmpeg",

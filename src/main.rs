@@ -21,7 +21,7 @@ enum Backend {
 #[command(
     name = "restic-browser",
     version,
-    about = "只读浏览 restic 快照、预览并导出单个文件"
+    about = "只读浏览 restic 快照、预览并导出文件或恢复目录"
 )]
 struct Cli {
     #[arg(short = 'r', long, env = "RESTIC_REPOSITORY")]
@@ -62,13 +62,26 @@ async fn run() -> Result<()> {
 
     rtoolbox::print_tty::print_tty("仓库密码: ").map_err(AppError::Io)?;
     let password = rpassword::read_password().map_err(AppError::Io)?;
-    let client: RepositoryHandle = match cli.backend {
-        Backend::Rustic => Arc::new(RusticClient::open(repository, password)?),
-        Backend::ResticCli => Arc::new(ResticCliClient::new(
-            cli.restic,
-            repository,
-            SecretString::from(password),
-        )?),
+    let (client, restore_client): (RepositoryHandle, Arc<ResticCliClient>) = match cli.backend {
+        Backend::Rustic => {
+            let restore_client = Arc::new(ResticCliClient::new(
+                cli.restic,
+                repository.clone(),
+                SecretString::from(password.clone()),
+            )?);
+            (
+                Arc::new(RusticClient::open(repository, password)?),
+                restore_client,
+            )
+        }
+        Backend::ResticCli => {
+            let restic_client = Arc::new(ResticCliClient::new(
+                cli.restic,
+                repository,
+                SecretString::from(password),
+            )?);
+            (restic_client.clone(), restic_client)
+        }
     };
     let snapshots = client
         .list_snapshots(CancellationToken::new())
@@ -77,7 +90,7 @@ async fn run() -> Result<()> {
             tracing::error!("{}", redact(&error.to_string()));
         })?;
 
-    let app = App::new(client, Arc::new(preview_service), snapshots);
+    let app = App::new(client, restore_client, Arc::new(preview_service), snapshots);
     terminal::run(app).await
 }
 

@@ -25,6 +25,7 @@ use crate::{
     model::{FileEntry, FileType, PreviewArtifact, SearchResult, Snapshot},
     preview::PreviewService,
     repository::RepositoryHandle,
+    restic::ResticCliClient,
 };
 
 const WIDE_LAYOUT_MIN_WIDTH: u16 = 120;
@@ -65,6 +66,7 @@ enum ActiveJob {
     Search(JobHandle<Vec<SearchResult>>),
     Preview(JobHandle<PreviewResult>),
     Export(JobHandle<PathBuf>),
+    Restore(JobHandle<PathBuf>),
 }
 
 struct TreeRow {
@@ -81,6 +83,7 @@ impl ActiveJob {
             Self::Search(job) => job.is_finished(),
             Self::Preview(job) => job.is_finished(),
             Self::Export(job) => job.is_finished(),
+            Self::Restore(job) => job.is_finished(),
         }
     }
 
@@ -90,12 +93,14 @@ impl ActiveJob {
             Self::Search(job) => job.cancel(),
             Self::Preview(job) => job.cancel(),
             Self::Export(job) => job.cancel(),
+            Self::Restore(job) => job.cancel(),
         }
     }
 }
 
 pub struct App {
     repository: RepositoryHandle,
+    restore_client: Arc<ResticCliClient>,
     preview_service: Arc<PreviewService>,
     export_service: ExportService,
     snapshots: Vec<Snapshot>,
@@ -129,6 +134,7 @@ pub struct App {
 impl App {
     pub fn new(
         repository: RepositoryHandle,
+        restore_client: Arc<ResticCliClient>,
         preview_service: Arc<PreviewService>,
         snapshots: Vec<Snapshot>,
     ) -> Self {
@@ -139,6 +145,7 @@ impl App {
         };
         let mut app = Self {
             repository,
+            restore_client,
             preview_service,
             export_service: ExportService,
             snapshots,
@@ -212,6 +219,10 @@ impl App {
                 Ok(path) => self.status = format!("已导出到 {}", path.display()),
                 Err(error) => self.show_error(error),
             },
+            ActiveJob::Restore(job) => match job.finish().await {
+                Ok(path) => self.status = format!("已恢复到 {}", path.display()),
+                Err(error) => self.show_error(error),
+            },
         }
     }
 
@@ -239,7 +250,7 @@ impl App {
                 KeyCode::Enter => {
                     let destination = std::mem::take(buffer);
                     self.input_mode = InputMode::Normal;
-                    self.start_export(PathBuf::from(destination));
+                    self.start_export(destination);
                 }
                 KeyCode::Backspace => {
                     buffer.pop();
@@ -288,7 +299,11 @@ impl App {
             KeyCode::Char('p') => self.start_preview(),
             KeyCode::Char('e') => {
                 if let Some(entry) = self.selected_file() {
-                    self.input_mode = InputMode::Export(entry.name.clone());
+                    if is_parent_entry(entry) {
+                        self.status = "不能导出上级目录项".to_owned();
+                    } else {
+                        self.input_mode = InputMode::Export(".".to_owned());
+                    }
                 }
             }
             KeyCode::Char('r') => self.start_directory_load(
@@ -612,18 +627,42 @@ impl App {
         )));
     }
 
-    fn start_export(&mut self, destination: PathBuf) {
+    fn start_export(&mut self, directory_input: String) {
         let Some(snapshot) = self.selected_snapshot().cloned() else {
             return;
         };
         let Some(entry) = self.selected_file().cloned() else {
             return;
         };
-        if destination.as_os_str().is_empty() {
-            self.status = "导出目标不能为空".to_owned();
+        if directory_input.is_empty() {
+            self.status = "导出目录不能为空".to_owned();
             return;
         }
+        if is_parent_entry(&entry) {
+            self.status = "不能导出上级目录项".to_owned();
+            return;
+        }
+        let directory = match expand_home_path(&directory_input, dirs::home_dir().as_deref()) {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.show_error(error);
+                return;
+            }
+        };
+        let destination = export_destination(&directory, &entry.name);
         self.replace_job();
+        if entry.is_dir() {
+            self.status = format!("正在恢复 {}…", entry.name);
+            let client = Arc::clone(&self.restore_client);
+            self.active_job = Some(ActiveJob::Restore(JobHandle::spawn_cancellable(
+                move |token| async move {
+                    client
+                        .restore_directory(&snapshot.id, &entry.path, &destination, token)
+                        .await
+                },
+            )));
+            return;
+        }
         self.status = if self.repository.content_index_ready() {
             format!("正在导出 {}…", entry.name)
         } else {
@@ -783,7 +822,14 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
     );
     match &app.input_mode {
         InputMode::Search(buffer) => render_prompt(frame, "搜索 restic pattern", buffer),
-        InputMode::Export(buffer) => render_prompt(frame, "导出目标（不覆盖）", buffer),
+        InputMode::Export(buffer) => {
+            let title = if app.selected_file().is_some_and(FileEntry::is_dir) {
+                "恢复目录到父目录（不合并同名目录）"
+            } else {
+                "导出文件到目录（不覆盖同名文件）"
+            };
+            render_prompt(frame, title, buffer);
+        }
         InputMode::Normal => {}
     }
 }
@@ -1128,6 +1174,37 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     .split(vertical[1])[1]
 }
 
+fn export_destination(directory: &Path, file_name: &str) -> PathBuf {
+    directory.join(file_name)
+}
+
+fn is_parent_entry(entry: &FileEntry) -> bool {
+    entry.name == ".." && entry.is_dir()
+}
+
+fn expand_home_path(input: &str, home: Option<&Path>) -> std::result::Result<PathBuf, AppError> {
+    let suffix = if input == "~" {
+        Some("")
+    } else {
+        input
+            .strip_prefix("~/")
+            .or_else(|| input.strip_prefix(r"~\"))
+    };
+    let Some(suffix) = suffix else {
+        return Ok(PathBuf::from(input));
+    };
+    let home = home.ok_or_else(|| {
+        AppError::InvalidPath(
+            "cannot expand ~ because the home directory is unavailable".to_owned(),
+        )
+    })?;
+    if suffix.is_empty() {
+        Ok(home.to_path_buf())
+    } else {
+        Ok(home.join(suffix))
+    }
+}
+
 fn move_index(index: &mut usize, length: usize, delta: isize) {
     if length > 0 {
         *index = (*index as isize + delta).clamp(0, length.saturating_sub(1) as isize) as usize;
@@ -1341,8 +1418,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        App, Focus, centered_rect, file_entry_style, format_detail_rows, format_size, page_index,
-        terminal_text_width,
+        App, Focus, InputMode, centered_rect, expand_home_path, export_destination,
+        file_entry_style, format_detail_rows, format_size, page_index, terminal_text_width,
     };
     use crate::{
         cache::SessionCache,
@@ -1387,7 +1464,7 @@ mod tests {
             "ffprobe",
             SessionCache::new().unwrap(),
         ));
-        let mut app = App::new(client, preview, snapshots);
+        let mut app = App::new(client.clone(), client, preview, snapshots);
         app.replace_job();
         app
     }
@@ -1453,6 +1530,102 @@ mod tests {
         let prompt = centered_rect(70, 3, outer);
         assert!(prompt.right() <= outer.right());
         assert!(prompt.bottom() <= outer.bottom());
+    }
+
+    #[test]
+    fn export_destination_preserves_the_original_file_name() {
+        let directory = std::path::PathBuf::from("exports").join("nested");
+        let file_name = "中文 空格 😀.txt";
+
+        assert_eq!(
+            export_destination(&directory, file_name),
+            directory.join(file_name)
+        );
+    }
+
+    #[tokio::test]
+    async fn export_dialog_defaults_to_the_current_directory() {
+        let mut app = test_app(vec![test_snapshot('a')]);
+        app.entries = vec![test_entry(
+            "中文 空格 😀.txt",
+            "/中文 空格 😀.txt",
+            FileType::File,
+        )];
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+
+        assert!(matches!(&app.input_mode, InputMode::Export(buffer) if buffer == "."));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = rendered_text(terminal.backend());
+        assert!(rendered.contains("导 出 文 件 到 目 录"));
+        assert!(rendered.contains("不 覆 盖 同 名 文 件"));
+    }
+
+    #[tokio::test]
+    async fn directory_export_dialog_describes_restore_to_a_parent_directory() {
+        let mut app = test_app(vec![test_snapshot('a')]);
+        app.entries = vec![test_entry("相册 😀", "/相册 😀", FileType::Directory)];
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+
+        assert!(matches!(&app.input_mode, InputMode::Export(buffer) if buffer == "."));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = rendered_text(terminal.backend());
+        assert!(rendered.contains("恢 复 目 录 到 父 目 录"));
+        assert!(rendered.contains("不 合 并 同 名 目 录"));
+    }
+
+    #[tokio::test]
+    async fn empty_export_directory_does_not_start_a_job() {
+        let mut app = test_app(vec![test_snapshot('a')]);
+        app.entries = vec![test_entry("file.txt", "/file.txt", FileType::File)];
+        app.input_mode = InputMode::Export(String::new());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert_eq!(app.status, "导出目录不能为空");
+        assert!(app.active_job.is_none());
+    }
+
+    #[tokio::test]
+    async fn synthetic_parent_entry_cannot_be_exported() {
+        let mut app = test_app(vec![test_snapshot('a')]);
+        app.entries = vec![test_entry("..", "/", FileType::Directory)];
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert_eq!(app.status, "不能导出上级目录项");
+    }
+
+    #[test]
+    fn expands_home_directory_without_expanding_other_tilde_forms() {
+        let home = std::path::Path::new("home").join("用户 😀");
+
+        assert_eq!(expand_home_path("~", Some(&home)).unwrap(), home);
+        assert_eq!(
+            expand_home_path("~/导出 目录", Some(&home)).unwrap(),
+            home.join("导出 目录")
+        );
+        assert_eq!(
+            expand_home_path(r"~\导出 目录", Some(&home)).unwrap(),
+            home.join("导出 目录")
+        );
+        assert_eq!(
+            expand_home_path("~other/export", Some(&home)).unwrap(),
+            std::path::PathBuf::from("~other/export")
+        );
+        assert!(matches!(
+            expand_home_path("~", None),
+            Err(crate::AppError::InvalidPath(_))
+        ));
     }
 
     #[test]
@@ -1533,7 +1706,7 @@ mod tests {
             tags: Vec::new(),
             total_bytes: Some(0),
         };
-        let mut app = App::new(client, preview, vec![snapshot]);
+        let mut app = App::new(client.clone(), client, preview, vec![snapshot]);
 
         for (width, height, wide) in [(80, 24, false), (120, 40, true), (92, 28, false)] {
             let backend = TestBackend::new(width, height);
@@ -1730,7 +1903,7 @@ mod tests {
             tags: Vec::new(),
             total_bytes: Some(0),
         };
-        let mut app = App::new(client, preview, vec![snapshot]);
+        let mut app = App::new(client.clone(), client, preview, vec![snapshot]);
         app.replace_job();
         app.focus = Focus::Files;
 

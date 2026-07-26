@@ -24,7 +24,7 @@ impl ExportService {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        if !parent.exists() {
+        if !parent.is_dir() {
             return Err(AppError::InvalidPath(format!(
                 "export directory does not exist: {}",
                 parent.display()

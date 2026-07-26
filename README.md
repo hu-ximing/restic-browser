@@ -1,7 +1,7 @@
 # restic-browser
 
 `restic-browser` 是一个只读 TUI，用来浏览本地 restic 仓库、搜索快照、预览文本、图片和
-视频帧，并安全导出单个文件。Windows x64 是当前发布优先级；代码和 CI 同时面向
+视频帧，并安全导出文件或恢复目录。Windows x64 是当前发布优先级；代码和 CI 同时面向
 Windows、Linux 和 macOS。
 
 ## 当前实现
@@ -9,7 +9,7 @@ Windows、Linux 和 macOS。
 - 默认后端是第三方 Rust 实现 `rustic_core`，打开仓库后复用同一个解锁会话。
 - `--backend restic-cli` 显式启用 restic 0.19.x CLI 对照/回退后端；不会静默回退。
 - ffmpeg 和 ffprobe 是外部依赖，用于媒体元数据和视频单帧预览。
-- 密码只保存在当前进程内存；产品功能只读仓库，导出单文件且拒绝覆盖。
+- 密码只保存在当前进程内存；产品功能只读仓库，文件导出和目录恢复均拒绝覆盖。
 - 当前只正式支持本地仓库，不提供备份、删除、修复或迁移功能。
 
 ```powershell

@@ -12,16 +12,19 @@ flowchart LR
     Main["main<br/>参数、密码、后端选择"] --> Repo["RepositoryReader<br/>只读领域接口"]
     Repo --> Rustic["RusticClient<br/>默认、进程内会话"]
     Repo --> CLI["ResticCliClient<br/>显式回退"]
+    Main --> RestoreCLI["ResticCliClient<br/>目录恢复专用"]
     Main --> App["App<br/>TUI 状态与交互"]
     Terminal["terminal<br/>事件与终端恢复"] <--> App
     App --> Jobs["JobHandle / ActiveJob<br/>一个活动任务"]
     Jobs --> Repo
     Jobs --> Preview["PreviewService"]
     Jobs --> Export["ExportService"]
+    Jobs --> RestoreCLI
     Preview --> Repo
     Export --> Repo
     Preview --> Cache["SessionCache<br/>512 MiB"]
     CLI --> ResticExe["restic 子进程"]
+    RestoreCLI --> ResticExe
     Preview --> Media["ffprobe / ffmpeg 子进程"]
 ```
 
@@ -30,8 +33,10 @@ flowchart LR
 ### 入口和后端选择
 
 `main.rs` 解析参数、启用可选日志、检查依赖、隐藏输入密码并构造后端。默认
-`--backend rustic` 使用 `RusticClient`；只有显式 `--backend restic-cli` 才检查并启动
-restic 0.19.x。两条路径都先列快照验证仓库，再进入 TUI，不做静默回退。
+`--backend rustic` 使用 `RusticClient`；显式 `--backend restic-cli` 时在启动阶段检查
+restic 0.19.x。两条路径都先列快照验证仓库，再进入 TUI，不做浏览后端的静默回退。
+入口还会构造一个共享的 CLI 客户端供目录恢复使用；rustic 浏览模式只在实际恢复目录时
+检查 restic，普通浏览、预览和文件导出不因此依赖 CLI。
 
 ffmpeg 和 ffprobe 当前在启动时检查，即使本次会话最终没有打开媒体预览。
 
@@ -64,9 +69,9 @@ ffmpeg 和 ffprobe 当前在启动时检查，即使本次会话最终没有打�
 
 ### CLI 回退
 
-`restic.rs` 的 `ResticCliClient` 实现相同接口。生产命令白名单只有 `snapshots`、`ls`、
-`find` 和 `dump`，另有启动前的 `version` 检查。每个操作启动独立 restic 子进程并完整
-收集 JSON/输出；取消会 kill 并 wait 子进程。
+`restic.rs` 的 `ResticCliClient` 实现相同接口，并额外提供不属于 `RepositoryReader` 的
+目录恢复能力。生产命令白名单为 `snapshots`、`ls`、`find`、`dump` 和 `restore`。每个
+操作启动独立 restic 子进程并完整收集 JSON/输出；取消会 kill 并 wait 子进程。
 
 ### TUI、应用状态和任务
 
@@ -74,9 +79,9 @@ ffmpeg 和 ffprobe 当前在启动时检查，即使本次会话最终没有打�
 它处理 Press/Repeat、忽略 Release，避免某些终端把按下和松开各处理一次。
 
 `app.rs` 保存快照、当前目录、选择、焦点、输入模式、预览、状态文本和一个
-`ActiveJob`。目录、搜索、预览和导出在后台执行；新任务取消并替换旧任务，`Esc` 取消当前
-任务。当前没有并发预取或任务优先级队列。`model.rs` 中有会话状态机领域类型，但运行时
-尚未接入手动锁定流程。
+`ActiveJob`。目录、搜索、预览、文件导出和目录恢复在后台执行；新任务取消并替换旧任务，
+`Esc` 取消当前任务。当前没有并发预取或任务优先级队列。`model.rs` 中有会话状态机领域
+类型，但运行时尚未接入手动锁定流程。
 
 ### 预览、导出和缓存
 
@@ -94,6 +99,10 @@ ffmpeg 和 ffprobe 当前在启动时检查，即使本次会话最终没有打�
 `ExportService` 拒绝已有目标，在目标同目录建立随机临时文件，读取成功后
 `persist_noclobber`。失败或取消时临时对象由作用域清理。
 
+目录恢复始终使用共享的 `ResticCliClient` 执行 `restore --overwrite never`。应用先独占
+创建“父目录/原目录名”，成功后保留，失败或取消时清理本次创建的目录。输入路径支持通过
+平台用户目录展开 `~`。
+
 `SessionCache` 是会话临时目录，容量上限 512 MiB，超限时删除最早注册的文件，退出时
 删除目录；它不是严格按访问时间更新的 LRU。`rustic_core` 和 restic CLI 另有各自的平台
 缓存，生产代码使用其默认位置。
@@ -104,7 +113,8 @@ ffmpeg 和 ffprobe 当前在启动时检查，即使本次会话最终没有打�
 | --- | --- | --- |
 | 仓库打开/解锁 | 进程内 `rustic_core` | 每个 restic 子进程 |
 | 快照、目录、搜索、读取 | `rustic_core` 只读适配器 | 参数数组启动 restic |
-| 仓库写命令/API | 不暴露、不调用 | 不在白名单 |
+| 目录恢复 | 统一调用独立 restic CLI 客户端 | `restic restore` |
+| 仓库写命令/API | 不暴露、不调用 | 不调用会修改仓库的命令 |
 | 媒体元数据/帧 | ffprobe/ffmpeg 子进程 | ffprobe/ffmpeg 子进程 |
 
 所有外部进程通过参数数组启动，不经过 shell，stdin 关闭。CLI 密码只进入对应 restic
@@ -119,7 +129,7 @@ ffmpeg 和 ffprobe 当前在启动时检查，即使本次会话最终没有打�
 - 日志只有指定 `--log-file` 才启用；已知敏感字段所在行统一替换为 `[redacted]`。
 - `rustic_core::Repository` 本身也有写 API，但 `RepositoryReader` 不暴露这些能力，当前
   适配器只调用打开、索引、快照树读取和 dump。真实仓库测试比较操作前后文件内容。
-- 允许的本地写入只有库自身缓存、会话临时目录和用户明确选择的导出目标。
+- 允许的本地写入只有库自身缓存、会话临时目录以及用户明确选择的文件或目录恢复目标。
 - 强制终止或断电不能保证 Rust 析构运行，可能遗留系统临时目录；当前没有跨会话扫描。
 
 ## 跨平台与终端兼容原则

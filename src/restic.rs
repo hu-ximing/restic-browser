@@ -33,6 +33,7 @@ enum Operation {
     List,
     Find,
     Dump,
+    Restore,
 }
 
 impl Operation {
@@ -42,6 +43,7 @@ impl Operation {
             Self::List => Some("ls"),
             Self::Find => Some("find"),
             Self::Dump => Some("dump"),
+            Self::Restore => Some("restore"),
         }
     }
 }
@@ -196,6 +198,67 @@ impl ResticCliClient {
             return Err(AppError::classify_stderr("restic", &stderr));
         }
         Ok(())
+    }
+
+    pub async fn restore_directory(
+        &self,
+        snapshot: &str,
+        source: &str,
+        destination: &Path,
+        token: CancellationToken,
+    ) -> Result<PathBuf> {
+        validate_snapshot_id(snapshot)?;
+        let source = normalize_repo_path(source)?;
+        if token.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        if destination.exists() {
+            return Err(AppError::DestinationExists(destination.to_path_buf()));
+        }
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if !parent.is_dir() {
+            return Err(AppError::InvalidPath(format!(
+                "restore parent directory does not exist: {}",
+                parent.display()
+            )));
+        }
+        Self::check_version(&self.executable).await?;
+        if token.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        std::fs::create_dir(destination).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                AppError::DestinationExists(destination.to_path_buf())
+            } else {
+                AppError::Io(error)
+            }
+        })?;
+
+        let snapshot_source = format!("{snapshot}:{source}");
+        let args = [
+            OsString::from("--overwrite"),
+            OsString::from("never"),
+            OsString::from("--target"),
+            destination.as_os_str().to_owned(),
+            OsString::from(snapshot_source),
+        ];
+        let result = self
+            .run_capture(Operation::Restore, args, token)
+            .await
+            .map(|_| destination.to_path_buf());
+        if let Err(error) = result {
+            return match std::fs::remove_dir_all(destination) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(AppError::Other(format!(
+                    "{error}; failed to clean partial restore at {}: {cleanup_error}",
+                    destination.display()
+                ))),
+            };
+        }
+        result
     }
 
     async fn run_capture<I, S>(
@@ -604,16 +667,23 @@ mod tests {
     }
 
     #[test]
-    fn production_operation_whitelist_is_read_only() {
+    fn production_operation_whitelist_is_bounded() {
         let commands = [
             Operation::Snapshots.command(),
             Operation::List.command(),
             Operation::Find.command(),
             Operation::Dump.command(),
+            Operation::Restore.command(),
         ];
         assert_eq!(
             commands,
-            [Some("snapshots"), Some("ls"), Some("find"), Some("dump")]
+            [
+                Some("snapshots"),
+                Some("ls"),
+                Some("find"),
+                Some("dump"),
+                Some("restore")
+            ]
         );
     }
 }
