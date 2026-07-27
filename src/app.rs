@@ -123,6 +123,7 @@ pub struct App {
     entry_index: usize,
     entry_offset: usize,
     entry_page_len: usize,
+    pending_entry_selection: Option<String>,
     current_path: String,
     directory_cache: HashMap<String, Vec<FileEntry>>,
     expanded_directories: HashSet<String>,
@@ -172,6 +173,7 @@ impl App {
             entry_index: 0,
             entry_offset: 0,
             entry_page_len: 0,
+            pending_entry_selection: None,
             current_path: "/".to_owned(),
             directory_cache: HashMap::new(),
             expanded_directories: HashSet::new(),
@@ -349,6 +351,7 @@ impl App {
                 self.current_path.clone(),
                 DirectoryLoadPurpose::Browse,
                 false,
+                None,
             ),
             KeyCode::Right => match self.focus {
                 Focus::Snapshots => self.open_snapshot_files(),
@@ -491,7 +494,7 @@ impl App {
             self.tree_path = "/".to_owned();
             self.tree_offset = 0;
             self.clear_preview();
-            self.start_directory_load("/".to_owned(), DirectoryLoadPurpose::Browse, false);
+            self.start_directory_load("/".to_owned(), DirectoryLoadPurpose::Browse, false, None);
         }
     }
 
@@ -523,7 +526,7 @@ impl App {
             return;
         }
         self.cancel_pending_tree_reveal_action();
-        self.start_directory_load(path, DirectoryLoadPurpose::Expand, true);
+        self.start_directory_load(path, DirectoryLoadPurpose::Expand, true, None);
     }
 
     fn collapse_tree_selection(&mut self) {
@@ -539,13 +542,14 @@ impl App {
         if self.current_path == "/" {
             return;
         }
+        let child = self.current_path.clone();
         if let Some(parent) = parent_repository_path(&self.current_path) {
-            self.browse_directory(parent);
+            self.start_directory_load(parent, DirectoryLoadPurpose::Browse, true, Some(child));
         }
     }
 
     fn browse_directory(&mut self, path: String) {
-        self.start_directory_load(path, DirectoryLoadPurpose::Browse, true);
+        self.start_directory_load(path, DirectoryLoadPurpose::Browse, true, None);
     }
 
     fn start_directory_load(
@@ -553,8 +557,10 @@ impl App {
         path: String,
         purpose: DirectoryLoadPurpose,
         use_cache: bool,
+        entry_selection: Option<String>,
     ) {
         if matches!(purpose, DirectoryLoadPurpose::Browse) {
+            self.pending_entry_selection = entry_selection;
             self.pending_tree_reveal = None;
             self.search_results_active = false;
             self.replace_job();
@@ -585,7 +591,11 @@ impl App {
         if matches!(purpose, DirectoryLoadPurpose::Expand) {
             self.replace_job();
         }
-        self.status = format!("{} {path}…", self.language.text("Loading", "正在加载"));
+        self.status = format!(
+            "{} {}…",
+            self.language.text("Loading", "正在加载"),
+            display_repository_path(&path)
+        );
         let client = Arc::clone(&self.repository);
         self.active_job = Some(ActiveJob::Directory(JobHandle::spawn_cancellable(
             move |token| async move {
@@ -618,6 +628,11 @@ impl App {
                 }
                 self.entry_index = 0;
                 self.entry_offset = 0;
+                if let Some(path) = self.pending_entry_selection.take()
+                    && let Some(index) = self.entries.iter().position(|entry| entry.path == path)
+                {
+                    self.entry_index = index;
+                }
                 self.status = format!(
                     "{} {count} {}",
                     self.language.text("Loaded", "已加载"),
@@ -731,7 +746,7 @@ impl App {
             .into_iter()
             .find(|path| !self.directory_cache.contains_key(path))
         {
-            self.start_directory_load(path, DirectoryLoadPurpose::Expand, false);
+            self.start_directory_load(path, DirectoryLoadPurpose::Expand, false, None);
         } else if let Some(action) = self
             .pending_tree_reveal
             .as_mut()
@@ -1276,7 +1291,7 @@ fn render_files(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .title(if app.language == Language::Chinese {
                 format!(
                     " 文件：{}（{} 个项目） ",
-                    app.current_path,
+                    display_repository_path(&app.current_path),
                     app.entries
                         .len()
                         .saturating_sub(usize::from(has_parent_entry(&app.entries)))
@@ -1284,7 +1299,7 @@ fn render_files(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } else {
                 format!(
                     " Files: {} ({} items) ",
-                    app.current_path,
+                    display_repository_path(&app.current_path),
                     app.entries
                         .len()
                         .saturating_sub(usize::from(has_parent_entry(&app.entries)))
@@ -1655,6 +1670,24 @@ fn format_size(size: u64) -> String {
     }
 }
 
+fn display_repository_path(path: &str) -> String {
+    if cfg!(windows) {
+        let bytes = path.as_bytes();
+        if bytes.len() >= 2
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && (bytes.len() == 2 || bytes[2] == b'/')
+        {
+            return if bytes.len() == 2 {
+                format!("{}:\\", &path[1..])
+            } else {
+                format!("{}:\\{}", &path[1..2], path[3..].replace('/', "\\"))
+            };
+        }
+    }
+    path.to_owned()
+}
+
 fn format_entry_details(
     entry: &FileEntry,
     snapshot: Option<&Snapshot>,
@@ -1672,7 +1705,10 @@ fn format_entry_details(
     format_detail_rows(&[
         (language.text("File", "文件"), entry.name.clone()),
         (language.text("Snapshot", "快照"), snapshot),
-        (language.text("Path", "路径"), entry.path.clone()),
+        (
+            language.text("Path", "路径"),
+            display_repository_path(&entry.path),
+        ),
         (
             language.text("Size", "大小"),
             format!("{} ({} bytes)", format_size(entry.size), entry.size),
@@ -1749,8 +1785,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        App, Focus, InputMode, centered_rect, expand_home_path, export_destination,
-        file_entry_style, format_detail_rows, format_size, page_index, terminal_text_width,
+        App, Focus, InputMode, centered_rect, display_repository_path, expand_home_path,
+        export_destination, file_entry_style, format_detail_rows, format_size, page_index,
+        terminal_text_width,
     };
     use crate::{
         cache::SessionCache,
@@ -1858,6 +1895,22 @@ mod tests {
     fn formats_sizes() {
         assert_eq!(format_size(0), "0 B");
         assert_eq!(format_size(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn formats_windows_repository_paths_for_display() {
+        let expected = if cfg!(windows) {
+            r"C:\some\dir"
+        } else {
+            "/C/some/dir"
+        };
+        assert_eq!(display_repository_path("/C/some/dir"), expected);
+        assert_eq!(
+            display_repository_path("/C"),
+            if cfg!(windows) { r"C:\" } else { "/C" }
+        );
+        assert_eq!(display_repository_path("/"), "/");
+        assert_eq!(display_repository_path("/config"), "/config");
     }
 
     #[test]
@@ -2740,6 +2793,29 @@ mod tests {
         assert!(app.preview_entry.is_none());
         assert_eq!(app.entries[0].name, "..");
         assert_eq!(app.entries[0].path, "/photos");
+    }
+
+    #[tokio::test]
+    async fn returning_to_parent_selects_the_directory_that_was_left() {
+        let mut app = test_app(vec![test_snapshot('a')]);
+        app.focus = Focus::Files;
+        app.current_path = "/documents/some-files".to_owned();
+        app.directory_cache.insert(
+            "/documents".to_owned(),
+            vec![
+                test_entry(
+                    "another-directory",
+                    "/documents/another-directory",
+                    FileType::Directory,
+                ),
+                test_entry("some-files", "/documents/some-files", FileType::Directory),
+            ],
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert_eq!(app.current_path, "/documents");
+        assert_eq!(app.selected_file().unwrap().path, "/documents/some-files");
     }
 
     #[tokio::test]
