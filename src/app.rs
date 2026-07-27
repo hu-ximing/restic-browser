@@ -10,6 +10,7 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols::border,
     text::{Line, Span},
     widgets::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
@@ -623,9 +624,6 @@ impl App {
                     action: None,
                 });
                 self.entries = load.entries;
-                if let Some(parent) = parent_repository_path(&load.path) {
-                    self.entries.insert(0, parent_entry(parent));
-                }
                 self.entry_index = 0;
                 self.entry_offset = 0;
                 if let Some(path) = self.pending_entry_selection.take()
@@ -1162,7 +1160,10 @@ fn render_snapshots(frame: &mut Frame<'_>, app: &mut App, area: Rect, condensed:
 }
 
 fn render_directory_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    app.adjust_pending_tree_view(usize::from(area.height.saturating_sub(2)));
+    let sections = Layout::vertical([Constraint::Fill(1), Constraint::Length(2)]).split(area);
+    let tree_area = sections[0];
+    let path_area = sections[1];
+    app.adjust_pending_tree_view(usize::from(tree_area.height.saturating_sub(2)));
     let rows = app.tree_rows();
     let path_rows = rows
         .iter()
@@ -1185,13 +1186,7 @@ fn render_directory_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let items = rows.iter().enumerate().map(|(row_index, row)| {
         let on_path =
             row.path == app.current_path || is_repository_ancestor(&row.path, &app.current_path);
-        let path_style = if row.path == app.current_path {
-            Style::default()
-                .fg(Color::Blue)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Blue)
-        };
+        let path_style = Style::default().fg(Color::Blue);
         let mut spans = Vec::new();
         let prefix = row.prefix.chars().collect::<Vec<_>>();
         for (segment_index, segment) in prefix.chunks(4).enumerate() {
@@ -1228,14 +1223,14 @@ fn render_directory_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Block::default()
                 .title(app.language.text(" Directory tree ", " 目录树 "))
                 .borders(Borders::ALL)
+                .border_set(border::Set {
+                    bottom_left: "├",
+                    bottom_right: "┤",
+                    ..border::PLAIN
+                })
                 .border_style(Style::default().fg(border)),
         )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::DarkGray))
         .highlight_symbol("");
     let selected = rows
         .iter()
@@ -1249,8 +1244,18 @@ fn render_directory_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut state = ListState::default()
         .with_selected(selected)
         .with_offset(app.tree_offset);
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, tree_area, &mut state);
     app.tree_offset = state.offset();
+    frame.render_widget(
+        Paragraph::new(format!(" {}", display_repository_path(&app.tree_path)))
+            .style(Style::default().fg(Color::Blue))
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+                    .border_style(Style::default().fg(border)),
+            ),
+        path_area,
+    );
 }
 
 fn render_files(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -1292,17 +1297,13 @@ fn render_files(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 format!(
                     " 文件：{}（{} 个项目） ",
                     display_repository_path(&app.current_path),
-                    app.entries
-                        .len()
-                        .saturating_sub(usize::from(has_parent_entry(&app.entries)))
+                    app.entries.len()
                 )
             } else {
                 format!(
                     " Files: {} ({} items) ",
                     display_repository_path(&app.current_path),
-                    app.entries
-                        .len()
-                        .saturating_sub(usize::from(has_parent_entry(&app.entries)))
+                    app.entries.len()
                 )
             })
             .borders(Borders::ALL)
@@ -1586,26 +1587,6 @@ fn repository_path_chain(path: &str) -> Vec<String> {
     }
     paths.reverse();
     paths
-}
-
-fn parent_entry(path: String) -> FileEntry {
-    FileEntry {
-        name: "..".to_owned(),
-        path,
-        file_type: FileType::Directory,
-        size: 0,
-        modified: None,
-        mode: None,
-        uid: None,
-        gid: None,
-        link_target: None,
-    }
-}
-
-fn has_parent_entry(entries: &[FileEntry]) -> bool {
-    entries
-        .first()
-        .is_some_and(|entry| entry.name == ".." && entry.is_dir())
 }
 
 fn is_repository_ancestor(candidate: &str, path: &str) -> bool {
@@ -2174,8 +2155,8 @@ mod tests {
 
         assert_eq!(app.current_path, "/home/photos");
         assert_eq!(app.tree_path, "/home/photos");
-        assert_eq!(app.entries[0].name, "..");
-        assert_eq!(app.entries[1].name, "image.jpg");
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.entries[0].name, "image.jpg");
         assert!(!app.search_results_active);
         assert!(app.active_job.is_none());
     }
@@ -2214,6 +2195,47 @@ mod tests {
         assert_eq!(file_entry_style(&symlink).fg, Some(Color::Cyan));
         assert_eq!(file_entry_style(&executable).fg, Some(Color::Green));
         assert_eq!(file_entry_style(&regular).fg, None);
+    }
+
+    #[tokio::test]
+    async fn directory_tree_footer_shows_the_selected_path() {
+        let mut app = test_app(vec![test_snapshot('a')]);
+        app.finish_directory_load(super::DirectoryLoad {
+            path: "/".to_owned(),
+            entries: vec![test_entry("photos", "/photos", FileType::Directory)],
+            purpose: super::DirectoryLoadPurpose::Browse,
+        });
+        app.focus = Focus::Directories;
+        app.tree_path = "/photos".to_owned();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let path_area = Rect::new(0, 34, 29, 3);
+        let (path_x, path_y) = find_symbol(terminal.backend(), path_area, "/");
+        let path = (0..path_area.width)
+            .filter_map(|offset| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((path_area.x + offset, path_y))
+                    .map(|cell| cell.symbol())
+            })
+            .collect::<String>();
+        let path_cell = terminal.backend().buffer().cell((path_x, path_y)).unwrap();
+
+        assert!(path.contains("/photos"));
+        assert_eq!(path_cell.fg, Color::Blue);
+        assert!(!path_cell.modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 34)).unwrap().symbol(),
+            "├"
+        );
+        assert_eq!(
+            terminal.backend().buffer().cell((28, 34)).unwrap().symbol(),
+            "┤"
+        );
     }
 
     #[tokio::test]
@@ -2330,6 +2352,7 @@ mod tests {
             .unwrap();
         assert_eq!(current_directory.fg, Color::Blue);
         assert_eq!(current_directory.bg, Color::Reset);
+        assert!(!current_directory.modifier.contains(Modifier::BOLD));
         assert!(!has_symbol(terminal.backend(), tree_area, ">"));
 
         app.focus = Focus::Directories;
@@ -2341,6 +2364,7 @@ mod tests {
             .unwrap();
         assert_eq!(selected_directory.fg, Color::Black);
         assert_eq!(selected_directory.bg, Color::DarkGray);
+        assert!(!selected_directory.modifier.contains(Modifier::BOLD));
 
         app.focus = Focus::Files;
         terminal.draw(|frame| app.draw(frame)).unwrap();
@@ -2776,7 +2800,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changing_directories_clears_preview_and_adds_parent_entry() {
+    async fn changing_directories_clears_preview_without_adding_a_parent_entry() {
         let mut app = test_app(vec![test_snapshot('a')]);
         app.current_path = "/photos".to_owned();
         app.preview_entry = Some(test_entry("old.jpg", "/photos/old.jpg", FileType::File));
@@ -2791,8 +2815,7 @@ mod tests {
 
         assert!(app.preview.is_none());
         assert!(app.preview_entry.is_none());
-        assert_eq!(app.entries[0].name, "..");
-        assert_eq!(app.entries[0].path, "/photos");
+        assert!(app.entries.is_empty());
     }
 
     #[tokio::test]
