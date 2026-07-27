@@ -17,10 +17,10 @@
 - 当前只正式支持本地仓库，不提供备份、删除、修复或迁移功能。
 - 界面默认使用英文；添加 `--cn` 可启用中文。
 
-```powershell
-restic-browser.exe -r D:\backup\restic-repo
-restic-browser.exe -r D:\backup\restic-repo --backend restic-cli
-restic-browser.exe -r D:\backup\restic-repo --cn
+```shell
+restic-browser -r /backup/restic-repo
+restic-browser -r /backup/restic-repo --backend restic-cli
+restic-browser -r /backup/restic-repo --cn
 ```
 
 也可通过 `RESTIC_REPOSITORY` 指定仓库。`--ffmpeg`、`--ffprobe` 可覆盖媒体工具路径；
@@ -36,9 +36,15 @@ CLI 回退后端还支持 `--restic`。`--log-file` 启用脱敏诊断日志。
 
 需要稳定版 Rust 工具链；Windows MSVC 目标还需要 Visual Studio C++ Build Tools。
 
-```powershell
+```shell
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked
 cargo build --release --locked
+```
+
+## 无需构建直接运行
+
+```shell
+cargo run --locked -- -r /backup/restic-repo --backend restic-cli
 ```

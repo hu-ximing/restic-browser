@@ -23,10 +23,10 @@ Windows x64 is the current release priority; the code and CI also target Linux a
   outside the current scope.
 - The interface is in English by default. Pass `--cn` to use Chinese.
 
-```powershell
-restic-browser.exe -r D:\backup\restic-repo
-restic-browser.exe -r D:\backup\restic-repo --backend restic-cli
-restic-browser.exe -r D:\backup\restic-repo --cn
+```shell
+restic-browser -r /backup/restic-repo
+restic-browser -r /backup/restic-repo --backend restic-cli
+restic-browser -r /backup/restic-repo --cn
 ```
 
 You can also set the repository with `RESTIC_REPOSITORY`. Use `--ffmpeg` and `--ffprobe` to
@@ -44,9 +44,15 @@ override the media tool paths. The CLI fallback backend also supports `--restic`
 A stable Rust toolchain is required. The Windows MSVC target also requires Visual Studio C++
 Build Tools.
 
-```powershell
+```shell
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked
 cargo build --release --locked
+```
+
+## Run without build
+
+```shell
+cargo run --locked -- -r /backup/restic-repo --backend restic-cli
 ```
