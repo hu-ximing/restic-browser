@@ -2,9 +2,9 @@
 
 [ [English](README.md) | 中文 ]
 
-`restic-browser` 是一个只读 TUI，用来浏览本地 restic 仓库、搜索快照、预览文本、图片和
-视频帧，并安全导出文件或恢复目录。Windows x64 是当前发布优先级；代码和 CI 同时面向
-Windows、Linux 和 macOS。
+`restic-browser` 是一个只读 TUI，用来浏览本地 restic 仓库、查看文件在不同快照中的
+版本历史、搜索快照、预览文本、图片和视频帧，并安全导出文件或恢复目录。Windows x64
+是当前发布优先级；代码和 CI 同时面向 Windows、Linux 和 macOS。
 
 ![程序截图](docs/images/screenshot.png)
 

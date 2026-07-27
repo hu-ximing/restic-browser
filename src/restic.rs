@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::Stdio,
@@ -12,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AppError, Result,
-    model::{FileEntry, FileType, SearchResult, Snapshot},
+    model::{FileEntry, FileType, FileVersion, SearchResult, Snapshot},
     process::read_limited,
     repository::RepositoryReader,
 };
@@ -21,6 +22,7 @@ const MAX_CAPTURE_STDOUT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CAPTURE_STDERR_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_SEARCH_RESULTS: usize = 100_000;
+const MAX_FILE_VERSIONS: usize = 100_000;
 
 #[derive(Debug, Clone)]
 pub struct ResticCliClient {
@@ -174,6 +176,60 @@ impl ResticCliClient {
         ];
         let stdout = self.run_capture(Operation::Find, args, token).await?;
         parse_find_output(snapshot, &stdout)
+    }
+
+    pub async fn list_file_versions(
+        &self,
+        snapshots: Vec<Snapshot>,
+        path: String,
+        token: CancellationToken,
+    ) -> Result<Vec<FileVersion>> {
+        let path = normalize_repo_path(&path)?;
+        if path == "/" {
+            return Ok(Vec::new());
+        }
+        let pattern = literal_find_pattern(&path);
+        let parse_token = token.clone();
+        let stdout = self
+            .run_capture(
+                Operation::Find,
+                [OsString::from("--json"), OsString::from(pattern)],
+                token,
+            )
+            .await?;
+        let matches = parse_find_output("", &stdout)?;
+        let snapshots = snapshots
+            .into_iter()
+            .enumerate()
+            .map(|(index, snapshot)| (snapshot.id.clone(), (index, snapshot)))
+            .collect::<HashMap<_, _>>();
+        let mut seen = HashSet::new();
+        let mut versions = Vec::new();
+        for result in matches {
+            if parse_token.is_cancelled() {
+                return Err(AppError::Cancelled);
+            }
+            if result.entry.path != path || !seen.insert(result.snapshot_id.clone()) {
+                continue;
+            }
+            let Some((order, snapshot)) = snapshots.get(&result.snapshot_id) else {
+                continue;
+            };
+            if versions.len() == MAX_FILE_VERSIONS {
+                return Err(AppError::InvalidResponse(format!(
+                    "file has more than {MAX_FILE_VERSIONS} snapshot records"
+                )));
+            }
+            versions.push((
+                *order,
+                FileVersion {
+                    snapshot: snapshot.clone(),
+                    entry: result.entry,
+                },
+            ));
+        }
+        versions.sort_by_key(|(order, _)| *order);
+        Ok(versions.into_iter().map(|(_, version)| version).collect())
     }
 
     pub async fn dump_to_path(
@@ -370,6 +426,17 @@ impl RepositoryReader for ResticCliClient {
         Box::pin(async move { ResticCliClient::find(self, &snapshot, &pattern, token).await })
     }
 
+    fn list_file_versions(
+        &self,
+        snapshots: Vec<Snapshot>,
+        path: String,
+        token: CancellationToken,
+    ) -> futures_util::future::BoxFuture<'_, Result<Vec<FileVersion>>> {
+        Box::pin(ResticCliClient::list_file_versions(
+            self, snapshots, path, token,
+        ))
+    }
+
     fn dump_to_path(
         &self,
         snapshot: &str,
@@ -537,6 +604,7 @@ fn collect_find_results(
         Value::Object(map) => {
             let snapshot_id = map
                 .get("snapshot_id")
+                .or_else(|| map.get("snapshot"))
                 .or_else(|| map.get("id"))
                 .and_then(Value::as_str)
                 .unwrap_or(default_snapshot);
@@ -563,6 +631,17 @@ fn collect_find_results(
         _ => {}
     }
     Ok(())
+}
+
+fn literal_find_pattern(path: &str) -> String {
+    path.chars()
+        .flat_map(|character| match character {
+            '*' => "[*]".chars().collect::<Vec<_>>(),
+            '?' => "[?]".chars().collect(),
+            '[' => "[[]".chars().collect(),
+            character => vec![character],
+        })
+        .collect()
 }
 
 fn string(value: &Value, key: &str) -> Result<String> {
@@ -686,6 +765,36 @@ mod tests {
         let entry = parse_file_entry(&value).unwrap().unwrap();
         assert_eq!(entry.name, "hello.txt");
         assert_eq!(entry.file_type, FileType::File);
+    }
+
+    #[test]
+    fn escapes_literal_paths_for_find() {
+        assert_eq!(
+            literal_find_pattern("/notes/[draft]*?.txt"),
+            "/notes/[[]draft][*][?].txt"
+        );
+    }
+
+    #[test]
+    fn parses_find_results_grouped_by_snapshot() {
+        let snapshot = "a".repeat(64);
+        let output = serde_json::to_vec(&serde_json::json!([{
+            "snapshot": snapshot,
+            "matches": [{
+                "path": "/notes/[draft]*?.txt",
+                "name": "[draft]*?.txt",
+                "type": "file",
+                "size": 42,
+                "mtime": "2026-07-22T00:00:00Z"
+            }]
+        }]))
+        .unwrap();
+
+        let results = parse_find_output("", &output).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].snapshot_id, "a".repeat(64));
+        assert_eq!(results[0].entry.path, "/notes/[draft]*?.txt");
     }
 
     #[test]

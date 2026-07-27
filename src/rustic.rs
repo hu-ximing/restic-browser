@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
@@ -24,7 +25,7 @@ use zeroize::Zeroize;
 use crate::{
     AppError, Result,
     error::redact,
-    model::{FileEntry, SearchResult, Snapshot},
+    model::{FileEntry, FileVersion, SearchResult, Snapshot},
     repository::RepositoryReader,
     restic::{normalize_repo_path, parse_file_entry, parse_snapshot},
 };
@@ -32,6 +33,7 @@ use crate::{
 type BlockingTask = Box<dyn FnOnce() + Send + 'static>;
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_SEARCH_RESULTS: usize = 100_000;
+const MAX_FILE_VERSIONS: usize = 100_000;
 
 #[derive(Clone)]
 struct BlockingExecutor {
@@ -250,6 +252,34 @@ impl RepositoryReader for RusticClient {
         })
     }
 
+    fn list_file_versions(
+        &self,
+        snapshots: Vec<Snapshot>,
+        path: String,
+        token: CancellationToken,
+    ) -> BoxFuture<'_, Result<Vec<FileVersion>>> {
+        let state = Arc::clone(&self.state);
+        let executor = self.executor.clone();
+        Box::pin(async move {
+            executor
+                .run(token, move |token| {
+                    let state = lock_state(&state)?;
+                    match &state.index {
+                        RusticIndex::Browse(repository) => {
+                            list_file_versions(repository, snapshots, &path, token)
+                        }
+                        RusticIndex::Full(repository) => {
+                            list_file_versions(repository, snapshots, &path, token)
+                        }
+                        RusticIndex::Unavailable => Err(AppError::Other(
+                            "repository index is unavailable".to_owned(),
+                        )),
+                    }
+                })
+                .await
+        })
+    }
+
     fn dump_to_path(
         &self,
         snapshot: &str,
@@ -374,6 +404,64 @@ fn find<S: IndexedTree>(
         }
     }
     Ok(results)
+}
+
+fn list_file_versions<S: IndexedTree>(
+    repository: &Repository<S>,
+    snapshots: Vec<Snapshot>,
+    path: &str,
+    token: &CancellationToken,
+) -> Result<Vec<FileVersion>> {
+    let path = normalize_repo_path(path)?;
+    if path == "/" {
+        return Ok(Vec::new());
+    }
+    if snapshots.len() > MAX_FILE_VERSIONS {
+        return Err(AppError::InvalidResponse(format!(
+            "file has more than {MAX_FILE_VERSIONS} snapshot records"
+        )));
+    }
+    let ids = snapshots
+        .iter()
+        .map(|snapshot| snapshot.id.as_str())
+        .collect::<Vec<_>>();
+    let raw_snapshots = repository.get_snapshots(&ids).map_err(map_rustic_error)?;
+    let mut trees = raw_snapshots
+        .into_iter()
+        .map(|snapshot| (snapshot.id.into_inner().to_hex().to_string(), snapshot.tree))
+        .collect::<HashMap<_, _>>();
+    let mut ordered_snapshots = Vec::with_capacity(snapshots.len());
+    let mut root_trees = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        ensure_not_cancelled(token)?;
+        let tree = trees.remove(&snapshot.id).ok_or_else(|| {
+            AppError::InvalidResponse(format!(
+                "rustic did not return snapshot {}",
+                snapshot.short_id
+            ))
+        })?;
+        ordered_snapshots.push(snapshot);
+        root_trees.push(tree);
+    }
+    let found = repository
+        .find_nodes_from_path(root_trees, Path::new(&path))
+        .map_err(map_rustic_error)?;
+    let relative = Path::new(path.trim_start_matches('/'));
+    let mut versions = Vec::new();
+    for (snapshot, matched) in ordered_snapshots.into_iter().zip(found.matches) {
+        ensure_not_cancelled(token)?;
+        let Some(node_index) = matched else {
+            continue;
+        };
+        let node = found.nodes.get(node_index).ok_or_else(|| {
+            AppError::InvalidResponse("rustic returned an invalid version node index".to_owned())
+        })?;
+        versions.push(FileVersion {
+            snapshot,
+            entry: node_to_entry("/", relative, node)?,
+        });
+    }
+    Ok(versions)
 }
 
 fn dump_file(

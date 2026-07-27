@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Result,
-    model::{FileEntry, SearchResult, Snapshot},
+    model::{FileEntry, FileVersion, SearchResult, Snapshot},
 };
 
 pub type RepositoryHandle = Arc<dyn RepositoryReader>;
@@ -27,6 +27,13 @@ pub trait RepositoryReader: Send + Sync {
         pattern: &str,
         token: CancellationToken,
     ) -> BoxFuture<'_, Result<Vec<SearchResult>>>;
+
+    fn list_file_versions(
+        &self,
+        snapshots: Vec<Snapshot>,
+        path: String,
+        token: CancellationToken,
+    ) -> BoxFuture<'_, Result<Vec<FileVersion>>>;
 
     fn dump_to_path(
         &self,

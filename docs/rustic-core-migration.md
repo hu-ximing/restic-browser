@@ -31,7 +31,7 @@ CLI 后端的每次目录、搜索、预览和导出都会创建新进程、重�
 ## 保持不变的边界
 
 - TUI 布局、键位、错误类别和一次输入密码的会话行为。
-- `Snapshot`、`FileEntry`、`SearchResult` 等领域模型。
+- `Snapshot`、`FileEntry`、`SearchResult`、`FileVersion` 等领域模型。
 - 快照倒序、逐层浏览、当前快照搜索、预览和单文件无覆盖导出。
 - 2 MiB 文本上限、512 MiB 媒体源上限和会话临时目录。
 - ffmpeg/ffprobe 只处理本地临时文件。

@@ -49,6 +49,12 @@ pub struct SearchResult {
     pub entry: FileEntry,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileVersion {
+    pub snapshot: Snapshot,
+    pub entry: FileEntry,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct MediaMetadata {
     pub format_name: Option<String>,

@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -24,7 +24,7 @@ use crate::{
     export::ExportService,
     jobs::JobHandle,
     language::Language,
-    model::{FileEntry, FileType, PreviewArtifact, SearchResult, Snapshot},
+    model::{FileEntry, FileType, FileVersion, PreviewArtifact, SearchResult, Snapshot},
     preview::PreviewService,
     repository::RepositoryHandle,
     restic::ResticCliClient,
@@ -32,12 +32,22 @@ use crate::{
 
 const WIDE_LAYOUT_MIN_WIDTH: u16 = 120;
 const WIDE_LAYOUT_MIN_HEIGHT: u16 = 30;
+const VERSION_HISTORY_DEBOUNCE: Duration = Duration::from_millis(300);
+const VERSION_CACHE_MAX_PATHS: usize = 128;
+const VERSION_CACHE_MAX_RECORDS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
     Snapshots,
     Directories,
     Files,
+    Versions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InspectorView {
+    Preview,
+    Versions,
 }
 
 enum InputMode {
@@ -69,14 +79,70 @@ struct DirectoryLoad {
 }
 
 struct PreviewResult {
+    snapshot: Snapshot,
     entry: FileEntry,
     artifact: PreviewArtifact,
+}
+
+struct VersionHistoryLoad {
+    path: String,
+    versions: Vec<FileVersion>,
+}
+
+struct PendingVersionHistory {
+    path: String,
+    due: Instant,
+}
+
+#[derive(Default)]
+struct VersionHistoryCache {
+    entries: HashMap<String, Vec<FileVersion>>,
+    order: VecDeque<String>,
+    records: usize,
+}
+
+impl VersionHistoryCache {
+    fn get(&mut self, path: &str) -> Option<Vec<FileVersion>> {
+        let versions = self.entries.get(path)?.clone();
+        self.touch(path);
+        Some(versions)
+    }
+
+    fn insert(&mut self, path: String, versions: Vec<FileVersion>) {
+        if let Some(previous) = self.entries.remove(&path) {
+            self.records = self.records.saturating_sub(previous.len());
+        }
+        self.order.retain(|cached| cached != &path);
+        while !self.entries.is_empty()
+            && (self.entries.len() >= VERSION_CACHE_MAX_PATHS
+                || self.records.saturating_add(versions.len()) > VERSION_CACHE_MAX_RECORDS)
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.records = self.records.saturating_sub(removed.len());
+            }
+        }
+        self.records = self.records.saturating_add(versions.len());
+        self.order.push_back(path.clone());
+        self.entries.insert(path, versions);
+    }
+
+    fn touch(&mut self, path: &str) {
+        self.order.retain(|cached| cached != path);
+        self.order.push_back(path.to_owned());
+    }
 }
 
 enum ActiveJob {
     Directory(JobHandle<DirectoryLoad>),
     Search(JobHandle<Vec<SearchResult>>),
     Preview(JobHandle<PreviewResult>),
+    Versions {
+        path: String,
+        job: JobHandle<VersionHistoryLoad>,
+    },
     Export(JobHandle<PathBuf>),
     Restore(JobHandle<PathBuf>),
 }
@@ -94,6 +160,7 @@ impl ActiveJob {
             Self::Directory(job) => job.is_finished(),
             Self::Search(job) => job.is_finished(),
             Self::Preview(job) => job.is_finished(),
+            Self::Versions { job, .. } => job.is_finished(),
             Self::Export(job) => job.is_finished(),
             Self::Restore(job) => job.is_finished(),
         }
@@ -104,6 +171,7 @@ impl ActiveJob {
             Self::Directory(job) => job.cancel(),
             Self::Search(job) => job.cancel(),
             Self::Preview(job) => job.cancel(),
+            Self::Versions { job, .. } => job.cancel(),
             Self::Export(job) => job.cancel(),
             Self::Restore(job) => job.cancel(),
         }
@@ -138,8 +206,18 @@ pub struct App {
     input_mode: InputMode,
     status: String,
     active_job: Option<ActiveJob>,
+    versions: Vec<FileVersion>,
+    version_path: Option<String>,
+    version_index: usize,
+    version_offset: usize,
+    version_page_len: usize,
+    pending_version_history: Option<PendingVersionHistory>,
+    version_cache: VersionHistoryCache,
+    version_error: Option<(String, String)>,
+    inspector_view: InspectorView,
     preview: Option<PreviewArtifact>,
     preview_entry: Option<FileEntry>,
+    preview_snapshot: Option<Snapshot>,
     image_protocol: Option<StatefulProtocol>,
     picker: Picker,
     video_position: Duration,
@@ -188,8 +266,18 @@ impl App {
             input_mode: InputMode::Normal,
             status: language.text("Ready", "就绪").to_owned(),
             active_job: None,
+            versions: Vec::new(),
+            version_path: None,
+            version_index: 0,
+            version_offset: 0,
+            version_page_len: 0,
+            pending_version_history: None,
+            version_cache: VersionHistoryCache::default(),
+            version_error: None,
+            inspector_view: InspectorView::Preview,
             preview: None,
             preview_entry: None,
+            preview_snapshot: None,
             image_protocol: None,
             picker,
             video_position: Duration::ZERO,
@@ -209,55 +297,58 @@ impl App {
     }
 
     pub async fn tick(&mut self) {
-        if !self.active_job.as_ref().is_some_and(ActiveJob::is_finished) {
-            return;
+        if self.active_job.as_ref().is_some_and(ActiveJob::is_finished)
+            && let Some(job) = self.active_job.take()
+        {
+            match job {
+                ActiveJob::Directory(job) => match job.finish().await {
+                    Ok(load) => self.finish_directory_load(load),
+                    Err(error) => {
+                        self.pending_tree_reveal = None;
+                        self.show_error(error);
+                    }
+                },
+                ActiveJob::Search(job) => match job.finish().await {
+                    Ok(results) => self.finish_search(results),
+                    Err(error) => self.show_error(error),
+                },
+                ActiveJob::Preview(job) => match job.finish().await {
+                    Ok(preview) => {
+                        self.set_preview(preview);
+                        self.status = self
+                            .language
+                            .text("Preview is ready", "预览已就绪")
+                            .to_owned();
+                    }
+                    Err(error) => self.show_error(error),
+                },
+                ActiveJob::Versions { path, job } => match job.finish().await {
+                    Ok(load) => self.finish_version_history_load(load),
+                    Err(error) => self.finish_version_history_error(path, error),
+                },
+                ActiveJob::Export(job) => match job.finish().await {
+                    Ok(path) => {
+                        self.status = format!(
+                            "{} {}",
+                            self.language.text("Exported to", "已导出到"),
+                            path.display()
+                        )
+                    }
+                    Err(error) => self.show_error(error),
+                },
+                ActiveJob::Restore(job) => match job.finish().await {
+                    Ok(path) => {
+                        self.status = format!(
+                            "{} {}",
+                            self.language.text("Restored to", "已恢复到"),
+                            path.display()
+                        )
+                    }
+                    Err(error) => self.show_error(error),
+                },
+            }
         }
-        let Some(job) = self.active_job.take() else {
-            return;
-        };
-        match job {
-            ActiveJob::Directory(job) => match job.finish().await {
-                Ok(load) => self.finish_directory_load(load),
-                Err(error) => {
-                    self.pending_tree_reveal = None;
-                    self.show_error(error);
-                }
-            },
-            ActiveJob::Search(job) => match job.finish().await {
-                Ok(results) => self.finish_search(results),
-                Err(error) => self.show_error(error),
-            },
-            ActiveJob::Preview(job) => match job.finish().await {
-                Ok(preview) => {
-                    self.set_preview(preview);
-                    self.status = self
-                        .language
-                        .text("Preview is ready", "预览已就绪")
-                        .to_owned();
-                }
-                Err(error) => self.show_error(error),
-            },
-            ActiveJob::Export(job) => match job.finish().await {
-                Ok(path) => {
-                    self.status = format!(
-                        "{} {}",
-                        self.language.text("Exported to", "已导出到"),
-                        path.display()
-                    )
-                }
-                Err(error) => self.show_error(error),
-            },
-            ActiveJob::Restore(job) => match job.finish().await {
-                Ok(path) => {
-                    self.status = format!(
-                        "{} {}",
-                        self.language.text("Restored to", "已恢复到"),
-                        path.display()
-                    )
-                }
-                Err(error) => self.show_error(error),
-            },
-        }
+        self.start_due_version_history();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -313,6 +404,7 @@ impl App {
             KeyCode::Char('`') => self.focus = Focus::Snapshots,
             KeyCode::Tab if self.wide_layout => self.focus = Focus::Directories,
             KeyCode::Char(' ') => self.focus = Focus::Files,
+            KeyCode::Char('v') => self.focus_versions(),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.page_selection(false),
@@ -324,17 +416,22 @@ impl App {
                 Focus::Directories => self.collapse_tree_selection(),
                 Focus::Files => self.go_parent(),
                 Focus::Snapshots => {}
+                Focus::Versions => self.focus = Focus::Files,
             },
             KeyCode::Left => match self.focus {
                 Focus::Directories => self.collapse_tree_selection(),
                 Focus::Files if self.current_path == "/" => self.focus = Focus::Snapshots,
                 Focus::Files => self.go_parent(),
                 Focus::Snapshots => {}
+                Focus::Versions => self.focus = Focus::Files,
             },
             KeyCode::Char('/') => self.input_mode = InputMode::Search(String::new()),
-            KeyCode::Char('p') => self.start_preview(),
+            KeyCode::Char('p') => {
+                self.inspector_view = InspectorView::Preview;
+                self.start_preview();
+            }
             KeyCode::Char('e') => {
-                if let Some(entry) = self.selected_file() {
+                if let Some((_, entry)) = self.selected_source() {
                     if is_parent_entry(entry) {
                         self.status = self
                             .language
@@ -357,7 +454,15 @@ impl App {
             KeyCode::Right => match self.focus {
                 Focus::Snapshots => self.open_snapshot_files(),
                 Focus::Directories => self.expand_tree_selection(),
+                Focus::Files
+                    if self
+                        .selected_file()
+                        .is_some_and(|entry| entry.file_type == FileType::File) =>
+                {
+                    self.focus_versions()
+                }
                 Focus::Files => self.enter_file_selection(),
+                Focus::Versions => {}
             },
             _ => {}
         }
@@ -382,6 +487,13 @@ impl App {
                 }
             }
             Focus::Files => move_index(&mut self.entry_index, self.entries.len(), delta),
+            Focus::Versions if self.versions_are_visible() => {
+                move_index(&mut self.version_index, self.versions.len(), delta)
+            }
+            Focus::Versions => {}
+        }
+        if self.focus == Focus::Files {
+            self.schedule_selected_file_history(VERSION_HISTORY_DEBOUNCE);
         }
     }
 
@@ -418,6 +530,17 @@ impl App {
                 self.entry_page_len,
                 down,
             ),
+            Focus::Versions if self.versions_are_visible() => page_index(
+                &mut self.version_index,
+                &mut self.version_offset,
+                self.versions.len(),
+                self.version_page_len,
+                down,
+            ),
+            Focus::Versions => {}
+        }
+        if self.focus == Focus::Files {
+            self.schedule_selected_file_history(VERSION_HISTORY_DEBOUNCE);
         }
     }
 
@@ -454,6 +577,17 @@ impl App {
                 self.entry_page_len,
                 end,
             ),
+            Focus::Versions if self.versions_are_visible() => edge_index(
+                &mut self.version_index,
+                &mut self.version_offset,
+                self.versions.len(),
+                self.version_page_len,
+                end,
+            ),
+            Focus::Versions => {}
+        }
+        if self.focus == Focus::Files {
+            self.schedule_selected_file_history(VERSION_HISTORY_DEBOUNCE);
         }
     }
 
@@ -472,6 +606,10 @@ impl App {
                 } else {
                     self.start_preview();
                 }
+            }
+            Focus::Versions => {
+                self.inspector_view = InspectorView::Preview;
+                self.start_preview();
             }
         }
     }
@@ -495,6 +633,7 @@ impl App {
             self.tree_path = "/".to_owned();
             self.tree_offset = 0;
             self.clear_preview();
+            self.clear_version_history_display();
             self.start_directory_load("/".to_owned(), DirectoryLoadPurpose::Browse, false, None);
         }
     }
@@ -565,6 +704,7 @@ impl App {
             self.pending_tree_reveal = None;
             self.search_results_active = false;
             self.replace_job();
+            self.clear_version_history_display();
             if path != self.current_path {
                 self.clear_preview();
             }
@@ -636,6 +776,7 @@ impl App {
                     self.language.text("Loaded", "已加载"),
                     self.language.text("items", "个项目")
                 );
+                self.schedule_selected_file_history(VERSION_HISTORY_DEBOUNCE);
             }
             DirectoryLoadPurpose::Expand => {
                 self.expanded_directories.insert(load.path);
@@ -708,6 +849,7 @@ impl App {
             self.entries.len(),
             self.language.text("items", "个项目")
         );
+        self.schedule_selected_file_history(VERSION_HISTORY_DEBOUNCE);
     }
 
     fn activate_search_result(&mut self, entry: FileEntry) {
@@ -754,7 +896,9 @@ impl App {
                 PendingTreeRevealAction::Browse => self.browse_directory(target),
                 PendingTreeRevealAction::Preview(entry) => {
                     self.current_path = target;
-                    self.start_preview_entry(entry);
+                    if let Some(snapshot) = self.selected_snapshot().cloned() {
+                        self.start_preview_source(snapshot, entry);
+                    }
                 }
             }
         }
@@ -784,6 +928,7 @@ impl App {
         self.replace_job();
         self.pending_tree_reveal = None;
         self.clear_preview();
+        self.clear_version_history_display();
         self.status = format!("{} {pattern}…", self.language.text("Searching", "正在搜索"));
         let client = Arc::clone(&self.repository);
         self.active_job = Some(ActiveJob::Search(JobHandle::spawn_cancellable(
@@ -792,17 +937,17 @@ impl App {
     }
 
     fn start_preview(&mut self) {
-        let Some(entry) = self.selected_file().cloned() else {
+        let Some((snapshot, entry)) = self
+            .selected_source()
+            .map(|(snapshot, entry)| (snapshot.clone(), entry.clone()))
+        else {
             return;
         };
         self.cancel_pending_tree_reveal_action();
-        self.start_preview_entry(entry);
+        self.start_preview_source(snapshot, entry);
     }
 
-    fn start_preview_entry(&mut self, entry: FileEntry) {
-        let Some(snapshot) = self.selected_snapshot().cloned() else {
-            return;
-        };
+    fn start_preview_source(&mut self, snapshot: Snapshot, entry: FileEntry) {
         if entry.is_dir() {
             self.status = self
                 .language
@@ -835,16 +980,20 @@ impl App {
                 let artifact = service
                     .preview(client, &snapshot.id, &entry, position, token)
                     .await?;
-                Ok(PreviewResult { entry, artifact })
+                Ok(PreviewResult {
+                    snapshot,
+                    entry,
+                    artifact,
+                })
             },
         )));
     }
 
     fn start_export(&mut self, directory_input: String) {
-        let Some(snapshot) = self.selected_snapshot().cloned() else {
-            return;
-        };
-        let Some(entry) = self.selected_file().cloned() else {
+        let Some((snapshot, entry)) = self
+            .selected_source()
+            .map(|(snapshot, entry)| (snapshot.clone(), entry.clone()))
+        else {
             return;
         };
         if directory_input.is_empty() {
@@ -929,12 +1078,186 @@ impl App {
         }
     }
 
+    fn focus_versions(&mut self) {
+        if self
+            .selected_file()
+            .is_none_or(|entry| entry.file_type != FileType::File)
+        {
+            self.inspector_view = InspectorView::Versions;
+            self.status = self
+                .language
+                .text(
+                    "Version history is available for regular files",
+                    "版本历史仅适用于普通文件",
+                )
+                .to_owned();
+            return;
+        }
+        self.schedule_selected_file_history(Duration::ZERO);
+        self.inspector_view = InspectorView::Versions;
+        self.focus = Focus::Versions;
+    }
+
+    fn versions_are_visible(&self) -> bool {
+        self.wide_layout || self.inspector_view == InspectorView::Versions
+    }
+
+    fn selected_regular_path(&self) -> Option<&str> {
+        self.selected_file()
+            .filter(|entry| entry.file_type == FileType::File)
+            .map(|entry| entry.path.as_str())
+    }
+
+    fn schedule_selected_file_history(&mut self, delay: Duration) {
+        let Some(path) = self.selected_regular_path().map(str::to_owned) else {
+            self.clear_version_history_display();
+            return;
+        };
+        if let Some(versions) = self.version_cache.get(&path) {
+            self.pending_version_history = None;
+            self.version_error = None;
+            self.apply_version_history(path, versions);
+            return;
+        }
+        if let Some(ActiveJob::Versions {
+            path: loading_path,
+            job,
+        }) = &self.active_job
+        {
+            if loading_path == &path {
+                self.pending_version_history = None;
+                self.version_path = Some(path);
+                self.version_error = None;
+                return;
+            }
+            job.cancel();
+        }
+        self.versions.clear();
+        self.version_path = Some(path.clone());
+        self.version_index = 0;
+        self.version_offset = 0;
+        self.version_error = None;
+        self.pending_version_history = Some(PendingVersionHistory {
+            path,
+            due: Instant::now() + delay,
+        });
+    }
+
+    fn start_due_version_history(&mut self) {
+        if self.active_job.is_some() {
+            return;
+        }
+        let Some(pending) = self.pending_version_history.as_ref() else {
+            return;
+        };
+        if pending.due > Instant::now() {
+            return;
+        }
+        let pending = self
+            .pending_version_history
+            .take()
+            .expect("pending version history was checked above");
+        if self.selected_regular_path() != Some(pending.path.as_str()) {
+            return;
+        }
+        self.status = format!(
+            "{} {}…",
+            self.language.text("Loading versions for", "正在加载版本"),
+            display_repository_path(&pending.path)
+        );
+        let client = Arc::clone(&self.repository);
+        let snapshots = self.snapshots.clone();
+        let path = pending.path;
+        let job_path = path.clone();
+        self.active_job = Some(ActiveJob::Versions {
+            path: job_path,
+            job: JobHandle::spawn_cancellable(move |token| async move {
+                let versions = client
+                    .list_file_versions(snapshots, path.clone(), token)
+                    .await?;
+                Ok(VersionHistoryLoad { path, versions })
+            }),
+        });
+    }
+
+    fn finish_version_history_load(&mut self, load: VersionHistoryLoad) {
+        self.version_cache
+            .insert(load.path.clone(), load.versions.clone());
+        if self.selected_regular_path() == Some(load.path.as_str()) {
+            let count = load.versions.len();
+            self.version_error = None;
+            self.apply_version_history(load.path, load.versions);
+            self.status = format!(
+                "{} {count} {}",
+                self.language.text("Loaded", "已加载"),
+                self.language.text("versions", "个版本")
+            );
+        }
+    }
+
+    fn finish_version_history_error(&mut self, path: String, error: AppError) {
+        if matches!(error, AppError::Cancelled) {
+            return;
+        }
+        if self.selected_regular_path() == Some(path.as_str()) {
+            let message = error.to_string();
+            self.versions.clear();
+            self.version_path = Some(path.clone());
+            self.version_error = Some((path, message.clone()));
+            self.status = format!("{}: {message}", self.language.text("Error", "错误"));
+        }
+    }
+
+    fn apply_version_history(&mut self, path: String, versions: Vec<FileVersion>) {
+        let active_snapshot = self
+            .selected_snapshot()
+            .map(|snapshot| snapshot.id.as_str());
+        self.version_index = active_snapshot
+            .and_then(|id| {
+                versions
+                    .iter()
+                    .position(|version| version.snapshot.id == id)
+            })
+            .unwrap_or(0);
+        self.version_offset = 0;
+        self.version_path = Some(path);
+        self.versions = versions;
+    }
+
+    fn clear_version_history_display(&mut self) {
+        self.pending_version_history = None;
+        if let Some(ActiveJob::Versions { job, .. }) = &self.active_job {
+            job.cancel();
+        }
+        self.versions.clear();
+        self.version_path = None;
+        self.version_index = 0;
+        self.version_offset = 0;
+        self.version_error = None;
+        if self.focus == Focus::Versions {
+            self.focus = Focus::Files;
+        }
+    }
+
     fn selected_snapshot(&self) -> Option<&Snapshot> {
         self.snapshots.get(self.active_snapshot_index)
     }
 
     fn selected_file(&self) -> Option<&FileEntry> {
         self.entries.get(self.entry_index)
+    }
+
+    fn selected_version(&self) -> Option<&FileVersion> {
+        self.versions.get(self.version_index)
+    }
+
+    fn selected_source(&self) -> Option<(&Snapshot, &FileEntry)> {
+        if self.focus == Focus::Versions {
+            self.selected_version()
+                .map(|version| (&version.snapshot, &version.entry))
+        } else {
+            Some((self.selected_snapshot()?, self.selected_file()?))
+        }
     }
 
     fn set_preview(&mut self, preview: PreviewResult) {
@@ -944,6 +1267,7 @@ impl App {
             }
             _ => None,
         };
+        self.preview_snapshot = Some(preview.snapshot);
         self.preview_entry = Some(preview.entry);
         self.preview = Some(preview.artifact);
     }
@@ -951,14 +1275,19 @@ impl App {
     fn clear_preview(&mut self) {
         self.preview = None;
         self.preview_entry = None;
+        self.preview_snapshot = None;
         self.image_protocol = None;
         self.video_position = Duration::ZERO;
     }
 
     fn set_wide_layout(&mut self, wide_layout: bool) {
+        let was_wide = self.wide_layout;
         self.wide_layout = wide_layout;
         if !wide_layout && self.focus == Focus::Directories {
             self.focus = Focus::Files;
+        }
+        if was_wide && !wide_layout && self.focus == Focus::Versions {
+            self.inspector_view = InspectorView::Versions;
         }
     }
 
@@ -1042,7 +1371,10 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
         render_snapshots(frame, app, navigation[0], true);
         render_directory_tree(frame, app, navigation[1]);
         render_files(frame, app, columns[1]);
-        render_preview(frame, app, columns[2]);
+        let inspector = Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(columns[2]);
+        render_version_history(frame, app, inspector[0]);
+        render_preview(frame, app, inspector[1]);
     } else {
         let content = Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)])
             .split(sections[1]);
@@ -1050,17 +1382,20 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
             .split(content[0]);
         render_snapshots(frame, app, browser[0], false);
         render_files(frame, app, browser[1]);
-        render_preview(frame, app, content[1]);
+        match app.inspector_view {
+            InspectorView::Versions => render_version_history(frame, app, content[1]),
+            InspectorView::Preview => render_preview(frame, app, content[1]),
+        }
     }
     let shortcuts = if wide_layout {
         app.language.text(
-            " [`]Snapshots [Tab]Tree [Space]Files [PgUp]/[PgDn]Page [Enter]Open [←]/[→]Navigate [/]Search [p]Preview [e]Export [r]Refresh [q]Quit",
-            " [`]快照 [Tab]目录树 [Space]文件 [PgUp]/[PgDn]翻页 [Enter]打开 [←]/[→]导航 [/]搜索 [p]预览 [e]导出 [r]刷新 [q]退出",
+            " [`]Snapshots [Tab]Tree [Space]Files [v]Versions [PgUp]/[PgDn]Page [Enter]Open [←]/[→]Navigate [/]Search [p]Preview [e]Export [r]Refresh [q]Quit",
+            " [`]快照 [Tab]目录树 [Space]文件 [v]版本 [PgUp]/[PgDn]翻页 [Enter]打开 [←]/[→]导航 [/]搜索 [p]预览 [e]导出 [r]刷新 [q]退出",
         )
     } else {
         app.language.text(
-            " [`]Snapshots [Space]Files [PgUp]/[PgDn]Page [Enter]Open [←]/[→]Navigate [/]Search [p]Preview [e]Export [r]Refresh [q]Quit",
-            " [`]快照 [Space]文件 [PgUp]/[PgDn]翻页 [Enter]打开 [←]/[→]导航 [/]搜索 [p]预览 [e]导出 [r]刷新 [q]退出",
+            " [`]Snapshots [Space]Files [v]Versions [p]Preview [PgUp]/[PgDn]Page [Enter]Open [←]/[→]Navigate [e]Export [q]Quit",
+            " [`]快照 [Space]文件 [v]版本 [p]预览 [PgUp]/[PgDn]翻页 [Enter]打开 [←]/[→]导航 [e]导出 [q]退出",
         )
     };
     frame.render_widget(
@@ -1078,7 +1413,10 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
             buffer,
         ),
         InputMode::Export(buffer) => {
-            let title = if app.selected_file().is_some_and(FileEntry::is_dir) {
+            let title = if app
+                .selected_source()
+                .is_some_and(|(_, entry)| entry.is_dir())
+            {
                 app.language.text(
                     "Restore directory into parent (do not merge existing directories)",
                     "恢复目录到父目录（不合并同名目录）",
@@ -1321,6 +1659,106 @@ fn render_files(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.entry_offset = state.offset();
 }
 
+fn render_version_history(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let selected = app.selected_file();
+    let title = selected
+        .map(|entry| {
+            format!(
+                " {}: {} ",
+                app.language.text("Version History", "版本历史"),
+                entry.name
+            )
+        })
+        .unwrap_or_else(|| {
+            app.language
+                .text(" Version History ", " 版本历史 ")
+                .to_owned()
+        });
+    let border = if app.focus == Focus::Versions && app.versions_are_visible() {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border));
+    let selected_path = selected.map(|entry| entry.path.as_str());
+    let message = if selected.is_none() {
+        Some(app.language.text("No file selected", "未选择文件"))
+    } else if selected.is_some_and(|entry| entry.file_type != FileType::File) {
+        Some(app.language.text(
+            "Version history is available for regular files",
+            "版本历史仅适用于普通文件",
+        ))
+    } else if let Some((error_path, error)) = &app.version_error {
+        (Some(error_path.as_str()) == selected_path).then_some(error.as_str())
+    } else if app
+        .active_job
+        .as_ref()
+        .is_some_and(|job| matches!(job, ActiveJob::Versions { path, .. } if Some(path.as_str()) == selected_path))
+        || app
+            .pending_version_history
+            .as_ref()
+            .is_some_and(|pending| Some(pending.path.as_str()) == selected_path)
+    {
+        Some(app.language.text("Loading versions…", "正在加载版本…"))
+    } else if app.versions.is_empty() {
+        Some(app.language.text("No versions found", "未找到版本"))
+    } else {
+        None
+    };
+    if let Some(message) = message {
+        frame.render_widget(
+            Paragraph::new(message)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        app.version_page_len = usize::from(area.height.saturating_sub(2));
+        return;
+    }
+
+    let rows = app.versions.iter().map(|version| {
+        Row::new([
+            version.snapshot.short_id.clone(),
+            format_snapshot_time(&version.snapshot.time),
+            format_size(version.entry.size),
+            version.snapshot.hostname.clone(),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(16),
+            Constraint::Length(10),
+            Constraint::Fill(1),
+        ],
+    )
+    .header(
+        Row::new([
+            app.language.text("Snapshot", "快照"),
+            app.language.text("Date", "日期"),
+            app.language.text("Size", "大小"),
+            app.language.text("Host", "主机"),
+        ])
+        .style(Style::default().fg(Color::Yellow)),
+    )
+    .block(block)
+    .row_highlight_style(Style::default().fg(Color::Black).bg(Color::DarkGray))
+    .highlight_symbol("");
+    app.version_page_len = usize::from(area.height.saturating_sub(3));
+    let mut state = TableState::default()
+        .with_selected(
+            (app.focus == Focus::Versions && app.versions_are_visible())
+                .then_some(app.version_index),
+        )
+        .with_offset(app.version_offset);
+    frame.render_stateful_widget(table, area, &mut state);
+    app.version_offset = state.offset();
+}
+
 fn render_preview(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let preview_name = app
         .preview_entry
@@ -1341,7 +1779,15 @@ fn render_preview(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let entry_details = app
         .preview_entry
         .as_ref()
-        .map(|entry| format_entry_details(entry, app.selected_snapshot(), app.language))
+        .map(|entry| {
+            format_entry_details(
+                entry,
+                app.preview_snapshot
+                    .as_ref()
+                    .or_else(|| app.selected_snapshot()),
+                app.language,
+            )
+        })
         .unwrap_or_default();
     let visual_details = match &app.preview {
         Some(PreviewArtifact::VideoFrame { metadata, .. }) => {
@@ -1401,8 +1847,8 @@ fn render_preview(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             app.language.text("Image preview", "图片预览").to_owned()
         }
         None => app
-            .selected_file()
-            .map(|entry| format_entry_details(entry, app.selected_snapshot(), app.language))
+            .selected_source()
+            .map(|(snapshot, entry)| format_entry_details(entry, Some(snapshot), app.language))
             .unwrap_or_default(),
     };
     if matches!(&app.preview, Some(PreviewArtifact::Text { .. })) && !entry_details.is_empty() {
@@ -1674,18 +2120,23 @@ fn format_entry_details(
     snapshot: Option<&Snapshot>,
     language: Language,
 ) -> String {
-    let snapshot = snapshot
-        .map(|snapshot| {
-            format!(
-                "{} ({})",
-                snapshot.short_id,
-                format_snapshot_time(&snapshot.time)
+    let (snapshot, host) = snapshot.map_or_else(
+        || ("-".to_owned(), "-".to_owned()),
+        |snapshot| {
+            (
+                format!(
+                    "{} ({})",
+                    snapshot.short_id,
+                    format_snapshot_time(&snapshot.time)
+                ),
+                snapshot.hostname.clone(),
             )
-        })
-        .unwrap_or_else(|| "-".to_owned());
+        },
+    );
     format_detail_rows(&[
         (language.text("File", "文件"), entry.name.clone()),
         (language.text("Snapshot", "快照"), snapshot),
+        (language.text("Host", "主机"), host),
         (
             language.text("Path", "路径"),
             display_repository_path(&entry.path),
@@ -1773,7 +2224,7 @@ mod tests {
     use crate::{
         cache::SessionCache,
         language::Language,
-        model::{FileEntry, FileType, SearchResult, Snapshot},
+        model::{FileEntry, FileType, FileVersion, SearchResult, Snapshot},
         preview::PreviewService,
         restic::ResticCliClient,
     };
@@ -1837,6 +2288,13 @@ mod tests {
         }
     }
 
+    fn test_version(snapshot: Snapshot, path: &str, size: u64) -> FileVersion {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let mut entry = test_entry(name, path, FileType::File);
+        entry.size = size;
+        FileVersion { snapshot, entry }
+    }
+
     fn rendered_text(backend: &TestBackend) -> String {
         backend
             .buffer()
@@ -1876,6 +2334,89 @@ mod tests {
     fn formats_sizes() {
         assert_eq!(format_size(0), "0 B");
         assert_eq!(format_size(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn version_history_cache_limits_the_number_of_paths() {
+        let mut cache = super::VersionHistoryCache::default();
+        for index in 0..=super::VERSION_CACHE_MAX_PATHS {
+            cache.insert(format!("/file-{index}"), Vec::new());
+        }
+
+        assert_eq!(cache.entries.len(), super::VERSION_CACHE_MAX_PATHS);
+        assert!(!cache.entries.contains_key("/file-0"));
+        assert!(
+            cache
+                .entries
+                .contains_key(&format!("/file-{}", super::VERSION_CACHE_MAX_PATHS))
+        );
+    }
+
+    #[tokio::test]
+    async fn version_history_defaults_to_the_active_snapshot_and_drives_actions() {
+        let active = test_snapshot('a');
+        let older = test_snapshot('b');
+        let mut app = test_app(vec![active.clone(), older.clone()]);
+        app.entries = vec![test_entry("notes.txt", "/notes.txt", FileType::File)];
+        app.apply_version_history(
+            "/notes.txt".to_owned(),
+            vec![
+                test_version(older.clone(), "/notes.txt", 1),
+                test_version(active.clone(), "/notes.txt", 2),
+            ],
+        );
+
+        assert_eq!(app.version_index, 1);
+        app.focus = Focus::Versions;
+        assert_eq!(app.selected_source().unwrap().0.id, active.id);
+        app.version_index = 0;
+        assert_eq!(app.selected_source().unwrap().0.id, older.id);
+    }
+
+    #[tokio::test]
+    async fn stale_version_results_are_cached_without_replacing_the_current_file() {
+        let snapshot = test_snapshot('a');
+        let mut app = test_app(vec![snapshot.clone()]);
+        app.entries = vec![test_entry("new.txt", "/new.txt", FileType::File)];
+
+        app.finish_version_history_load(super::VersionHistoryLoad {
+            path: "/old.txt".to_owned(),
+            versions: vec![test_version(snapshot, "/old.txt", 1)],
+        });
+
+        assert!(app.versions.is_empty());
+        assert!(app.version_cache.entries.contains_key("/old.txt"));
+    }
+
+    #[tokio::test]
+    async fn file_selection_schedules_version_history_after_the_debounce() {
+        let mut app = test_app(vec![test_snapshot('a')]);
+        app.entries = vec![test_entry("notes.txt", "/notes.txt", FileType::File)];
+        let started = std::time::Instant::now();
+
+        app.schedule_selected_file_history(super::VERSION_HISTORY_DEBOUNCE);
+
+        let pending = app
+            .pending_version_history
+            .as_ref()
+            .expect("version history should be pending");
+        assert_eq!(pending.path, "/notes.txt");
+        assert!(pending.due.saturating_duration_since(started) >= super::VERSION_HISTORY_DEBOUNCE);
+        app.start_due_version_history();
+        assert!(app.active_job.is_none());
+    }
+
+    #[test]
+    fn preview_details_include_the_version_snapshot_and_host() {
+        let snapshot = test_snapshot('b');
+        let details = super::format_entry_details(
+            &test_entry("notes.txt", "/notes.txt", FileType::File),
+            Some(&snapshot),
+            Language::English,
+        );
+
+        assert!(details.contains(&snapshot.short_id));
+        assert!(details.contains("test-host"));
     }
 
     #[test]
@@ -2281,6 +2822,7 @@ mod tests {
             let rendered = rendered_text(terminal.backend());
             assert!(rendered.contains("Files:"));
             assert!(rendered.contains("Preview"));
+            assert_eq!(rendered.contains("Version History"), wide);
             assert!(rendered.contains("[`]"));
             assert_eq!(rendered.contains("Directory tree"), wide);
             if wide {
@@ -2306,6 +2848,31 @@ mod tests {
         assert!(rendered.contains("目 录 树"));
         assert!(rendered.contains("文 件 ："));
         assert!(rendered.contains("预 览"));
+        assert!(rendered.contains("版 本 历 史"));
+    }
+
+    #[tokio::test]
+    async fn compact_layout_switches_between_versions_and_preview() {
+        let snapshot = test_snapshot('a');
+        let mut app = test_app(vec![snapshot.clone()]);
+        app.entries = vec![test_entry("notes.txt", "/notes.txt", FileType::File)];
+        app.apply_version_history(
+            "/notes.txt".to_owned(),
+            vec![test_version(snapshot, "/notes.txt", 1)],
+        );
+        app.focus = Focus::Versions;
+        app.inspector_view = super::InspectorView::Versions;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert!(rendered_text(terminal.backend()).contains("Version History"));
+
+        app.inspector_view = super::InspectorView::Preview;
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = rendered_text(terminal.backend());
+        assert!(rendered.contains("Preview"));
+        assert!(!rendered.contains("Version History"));
     }
 
     #[tokio::test]
@@ -2459,7 +3026,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn horizontal_arrows_navigate_directories_but_do_not_preview_files() {
+    async fn horizontal_arrows_navigate_directories_and_open_file_versions() {
         let repository = tempfile::tempdir().unwrap();
         let client = Arc::new(
             ResticCliClient::new(
@@ -2529,8 +3096,11 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.status, "unchanged");
         assert!(app.active_job.is_none());
+        assert_eq!(app.focus, Focus::Versions);
 
         app.current_path = "/".to_owned();
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Files);
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Snapshots);
 

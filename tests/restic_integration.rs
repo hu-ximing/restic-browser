@@ -297,6 +297,119 @@ async fn real_repository_browse_search_dump_and_export() {
 }
 
 #[tokio::test]
+async fn both_backends_list_and_read_file_versions_across_hosts() {
+    if !has_supported_restic() {
+        eprintln!("skipped: restic 0.19.x is not available");
+        return;
+    }
+
+    let fixture = TempDir::new().expect("fixture directory");
+    let repository = fixture.path().join("version-repository");
+    let source = fixture.path().join("版本 [草稿] 😀.txt");
+    let source_name = source.file_name().unwrap().to_str().unwrap();
+    let first = b"first version";
+    let second = b"second version with a different size";
+
+    run_restic(&repository, &["init", "--repository-version", "2"], None);
+    std::fs::write(&source, first).expect("write first version");
+    run_restic(
+        &repository,
+        &["backup", "--host", "history-host-one", source_name],
+        Some(fixture.path()),
+    );
+    std::fs::write(&source, second).expect("write second version");
+    run_restic(
+        &repository,
+        &["backup", "--host", "history-host-two", source_name],
+        Some(fixture.path()),
+    );
+    run_restic(
+        &repository,
+        &["backup", "--host", "history-host-three", source_name],
+        Some(fixture.path()),
+    );
+    let repository_before = repository_manifest(&repository);
+
+    let cli = ResticCliClient::new(
+        "restic",
+        &repository,
+        SecretString::from(PASSWORD.to_owned()),
+    )
+    .expect("CLI client")
+    .with_cache_dir(fixture.path().join("version-cli-cache"));
+    let rustic = RusticClient::open_with_cache_dir(
+        &repository,
+        PASSWORD.to_owned(),
+        Some(fixture.path().join("version-rustic-cache")),
+    )
+    .expect("rustic client");
+    let snapshots = rustic
+        .list_snapshots(CancellationToken::new())
+        .await
+        .expect("version snapshots");
+    assert_eq!(snapshots.len(), 3);
+    let latest_entries = rustic
+        .list_directory(&snapshots[0].id, "/", CancellationToken::new())
+        .await
+        .expect("latest root");
+    let entry = latest_entries
+        .iter()
+        .find(|entry| entry.name == source_name)
+        .expect("versioned file");
+
+    assert!(!rustic.content_index_ready());
+    let rustic_versions = rustic
+        .list_file_versions(
+            snapshots.clone(),
+            entry.path.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("rustic versions");
+    let cli_versions = cli
+        .list_file_versions(snapshots, entry.path.clone(), CancellationToken::new())
+        .await
+        .expect("CLI versions");
+    assert!(!rustic.content_index_ready());
+    assert_eq!(rustic_versions.len(), 3);
+    assert_eq!(
+        rustic_versions
+            .iter()
+            .map(|version| (
+                version.snapshot.id.as_str(),
+                version.snapshot.hostname.as_str(),
+                version.entry.size,
+            ))
+            .collect::<Vec<_>>(),
+        cli_versions
+            .iter()
+            .map(|version| (
+                version.snapshot.id.as_str(),
+                version.snapshot.hostname.as_str(),
+                version.entry.size,
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(rustic_versions[0].entry.size, second.len() as u64);
+    assert_eq!(rustic_versions[1].entry.size, second.len() as u64);
+    assert_eq!(rustic_versions[2].entry.size, first.len() as u64);
+
+    let oldest = rustic_versions.last().expect("oldest version");
+    let exported = fixture.path().join("oldest-version.txt");
+    rustic
+        .dump_to_path(
+            &oldest.snapshot.id,
+            &oldest.entry.path,
+            &exported,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("read oldest version");
+    assert_eq!(std::fs::read(exported).unwrap(), first);
+    assert_eq!(repository_before, repository_manifest(&repository));
+}
+
+#[tokio::test]
 async fn rustic_reads_repository_format_v1() {
     if !has_supported_restic() {
         eprintln!("skipped: restic 0.19.x is not available");

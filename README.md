@@ -2,8 +2,9 @@
 
 [ English | [中文](README_cn.md) ]
 
-`restic-browser` is a read-only TUI for browsing local restic repositories, searching snapshots,
-previewing text, images, and video frames, and safely exporting files or restoring directories.
+`restic-browser` is a read-only TUI for browsing local restic repositories, viewing a file's
+history across snapshots, searching snapshots, previewing text, images, and video frames, and
+safely exporting files or restoring directories.
 Windows x64 is the current release priority; the code and CI also target Linux and macOS.
 
 ![application screenshot](docs/images/screenshot.png)
